@@ -1,0 +1,42 @@
+[package]
+name = "graphidxbaselines"
+authors = ["Erik Thordsen"]
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "graphidxbaselines"
+crate-type = ["cdylib", "lib"]
+path = "src/lib.rs"
+test = true
+doc = true
+
+[dependencies]
+graphidx = { path = "../GraphIndexAPI", default-features = false }
+num = "0.4.0"
+ndarray = "0.15" # Has to be the same as used by hdf5 to work
+ndarray-rand = "0.14.0"
+ndarray-linalg = {version="0.16.0", features = ["openblas-system"]}
+ndarray-stats = "0.6.0"
+rand = "0.8.5"
+futures = "0.3.28"
+paste = "1.0.12"
+probability = "0.20.3"
+indicatif = "0.17.3"
+hdf5 = "0.8.1"
+rayon = "1.7.0"
+half = {version="2.2.1", features=["num-traits"]}
+foldhash = "0.1.4"
+
+[features]
+default = []
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.release]
+codegen-units = 1
+
+
