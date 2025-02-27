@@ -1,6 +1,7 @@
 .vscode
 Cargo.lock
 target
+lib
 
 *.sh
 flamegraph.svg
@@ -8,3 +9,6 @@ perf.data
 perf.data.old
 
 *_unused.*
+*_dump
+# Any top level python scripts
+/*.py

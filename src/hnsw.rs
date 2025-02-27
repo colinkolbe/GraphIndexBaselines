@@ -16,6 +16,7 @@ use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSlice;
 use rayon::slice::ParallelSliceMut;
+use ndarray::Array2;
 
 use crate::util::remove_duplicates_with_key;
 
@@ -53,6 +54,12 @@ impl<R: UnsignedInteger, F: Float> Graph<R> for HNSWHeapBuildGraph<R,F> {
 	fn neighbors(&self, vertex: R) -> Vec<R> {
 		self.adjacency[vertex.to_usize().unwrap()].iter().map(|&(_,v)| v).collect()
 	}
+	fn foreach_neighbor<Fun: FnMut(&R)>(&self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|v|f(&v.1));
+	}
+	fn foreach_neighbor_mut<Fun: FnMut(&mut R)>(&mut self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|v|f(&mut v.1));
+	}
 	fn add_node(&mut self) {
 		self.adjacency.push(MaxHeap::new());
 	}
@@ -86,7 +93,13 @@ impl<R: UnsignedInteger, F: Float> WeightedGraph<R,F> for HNSWHeapBuildGraph<R,F
 	fn neighbors_with_zipped_weights(&self, vertex: R) -> Vec<(F,R)> {
 		self.adjacency[vertex.to_usize().unwrap()].iter().map(|&v|v).collect()
 	}
-	fn as_viewable_weighted_adj_graph(&self) -> Option<&dyn ViewableWeightedAdjGraph<R,F>> {
+	fn foreach_neighbor_with_zipped_weight<Fun: FnMut(&F, &R)>(&self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|&v| f(&v.0,&v.1));
+	}
+	fn foreach_neighbor_with_zipped_weight_mut<Fun: FnMut(&mut F, &mut R)>(&mut self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|(w,v)| f(w,v));
+	}
+	fn as_viewable_weighted_adj_graph(&self) -> Option<&impl ViewableWeightedAdjGraph<R,F>> {
 		Some(self)
 	}
 }
@@ -109,7 +122,15 @@ fn make_greedy_index<
 	Dist: Distance<F>,
 	G: Graph<R>,
 >(graphs: Vec<G>, local_layer_ids: Vec<Vec<R>>, global_layer_ids: Vec<Vec<R>>, mat: M, dist: Dist, higher_level_max_heap_size: usize) -> GreedyLayeredGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
-	GreedyLayeredGraphIndex::new(mat, graphs.iter().map(|g|g.as_dir_lol_graph()).collect(), local_layer_ids, global_layer_ids, dist, higher_level_max_heap_size)
+	GreedyLayeredGraphIndex::new(
+		mat,
+		graphs.iter().map(|g|g.as_dir_lol_graph()).collect(),
+		local_layer_ids,
+		global_layer_ids,
+		dist,
+		higher_level_max_heap_size,
+		Some(vec![R::zero()]),
+	)
 }
 #[inline(always)]
 fn make_greedy_capped_index<
@@ -119,7 +140,15 @@ fn make_greedy_capped_index<
 	Dist: Distance<F>,
 	G: Graph<R>,
 >(graphs: Vec<G>, local_layer_ids: Vec<Vec<R>>, global_layer_ids: Vec<Vec<R>>, mat: M, dist: Dist, higher_level_max_heap_size: usize, max_frontier_size: usize) -> GreedyCappedLayeredGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
-	GreedyCappedLayeredGraphIndex::new(mat, graphs.iter().map(|g|g.as_dir_lol_graph()).collect(), local_layer_ids, global_layer_ids, dist, higher_level_max_heap_size, max_frontier_size)
+	GreedyCappedLayeredGraphIndex::new(
+		mat,
+		graphs.iter().map(|g|g.as_dir_lol_graph()).collect(),
+		local_layer_ids,
+		global_layer_ids,
+		dist,
+		higher_level_max_heap_size,
+		max_frontier_size, Some(vec![R::zero()]),
+	)
 }
 #[inline(always)]
 pub fn random_level(level_norm_param: f32, max_level: usize) -> usize {
@@ -2426,6 +2455,151 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 
 
 
+pub fn load_hnswlib_parts<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> (Array2<F>, Vec<DirLoLGraph<R>>, Vec<Vec<R>>, Vec<Vec<R>>, R) {
+	use std::fs::File;
+	use std::io::BufReader;
+	use std::io::Read;
+	let mut reader = BufReader::new(File::open(file).unwrap());
+	/* Load the entire file into RAM */
+	let mut file_data = Vec::new();
+	reader.read_to_end(&mut file_data).unwrap();
+	fn get_type_at<T: Sized+Copy>(data: &Vec<u8>, offset: usize) -> T {
+		unsafe{*(data[offset..offset+std::mem::size_of::<T>()].as_ptr() as *const T)}
+	}
+	fn get_vec<T: Sized+Copy>(data: &Vec<u8>, offset: usize, count: usize) -> Vec<T> {
+		let t_size = std::mem::size_of::<T>();
+		(0..count).map(|i| get_type_at(data, offset + i*t_size)).collect()
+	}
+	let curr_elements = get_type_at::<u64>(&file_data, 16);
+	let size_per_elem = get_type_at::<u64>(&file_data, 24);
+	let max_level = get_type_at::<i32>(&file_data, 48) as usize;
+	let entry_point = get_type_at::<u32>(&file_data, 52) as usize;
+	let max_m = get_type_at::<u64>(&file_data, 56);
+	let max_m0 = get_type_at::<u64>(&file_data, 64);
+	let data_level_0_mem_size = curr_elements * size_per_elem;
+	let size_links_level0 = max_m0 * 4 + 4;
+	let dim = (data_level_0_mem_size / curr_elements - 8 - size_links_level0) / 4;
+	let mut data = Array2::from_elem((curr_elements as usize, dim as usize), F::zero());
+	/* Read global IDs from level 0 data and compute the order of storage */
+	let mut ids = Vec::with_capacity(curr_elements as usize);
+	let level_0_start = 12*8 as usize;
+	let level_0_end = level_0_start + data_level_0_mem_size as usize;
+	(0..curr_elements as usize).for_each(|i| {
+		let offset = level_0_start + (i+1)*(size_per_elem as usize) - 8;
+		let id = get_type_at::<u64>(&file_data, offset);
+		ids.push(id as usize);
+		get_vec::<f32>(
+			&file_data,
+			level_0_start
+			+ i*size_per_elem as usize
+			+ 4
+			+ 4*max_m0 as usize,
+			dim as usize
+		).iter().enumerate().for_each(|(j, &x)| {
+			data[[i,j]] = F::from_f32(x).unwrap();
+		});
+	});
+	let mut order = (0..curr_elements as usize).collect::<Vec<_>>();
+	order.sort_by_key(|&i| ids[i]);
+	assert!(order.iter().enumerate().all(|(i,&j)| i==ids[j] as usize), "Global IDs are not contiguous, unique, or starting at 0");
+	/* Iterate over the data and build the adjacency lists */
+	let mut adjs: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); curr_elements as usize]; max_level+1];
+	let mut higher_offset = level_0_end;
+	let higher_adj_size = 4*max_m as usize + 4;
+	let mut node_levels: Vec<usize> = vec![0; curr_elements as usize];
+	(0..curr_elements as usize).for_each(|i_obj| {
+		let n_neighbors_0 = get_type_at::<u32>(&file_data, level_0_start + i_obj*size_per_elem as usize) as usize;
+		assert!(n_neighbors_0 <= max_m0 as usize, "Too many neighbors in level 0: {:?}", n_neighbors_0);
+		let adj_0 = get_vec::<u32>(&file_data, level_0_start + i_obj*size_per_elem as usize + 4, n_neighbors_0);
+		adj_0.into_iter().for_each(|x| adjs[0][i_obj].push(x as usize));
+		let n_bytes_higher_adjs = get_type_at::<u32>(&file_data, higher_offset) as usize;
+		assert!(n_bytes_higher_adjs % higher_adj_size == 0, "Invalid higher adjacency list size: {:?}", n_bytes_higher_adjs);
+		higher_offset += 4;
+		let level = n_bytes_higher_adjs / higher_adj_size;
+		node_levels[ids[i_obj]] = level;
+		(0..level).for_each(|i_level| {
+			let list_pos = higher_offset + i_level*higher_adj_size;
+			let n_neighbors_i = get_type_at::<u32>(&file_data, list_pos) as usize;
+			assert!(n_neighbors_i <= max_m as usize, "Too many neighbors in level {:?}: {:?}", i_level+1, n_neighbors_i);
+			let adj_i = get_vec::<u32>(&file_data, list_pos + 4, n_neighbors_i);
+			adj_i.into_iter().for_each(|x| adjs[i_level+1][ids[i_obj]].push(ids[x as usize]));
+		});
+		higher_offset += n_bytes_higher_adjs;
+	});
+	/* Translate adjacency lists into graphs and ID maps */
+	let mut graphs: Vec<DirLoLGraph<R>> = (0..max_level+1).map(|_| DirLoLGraph::new()).collect();
+	let mut local_id_maps = vec![Vec::new(); max_level];
+	let mut global_id_maps = vec![Vec::new(); max_level];
+	adjs.iter().enumerate().for_each(|(i_level, adj)| {
+		let mut adj_id_map = Vec::with_capacity(curr_elements as usize);
+		let mut found_nodes = 0;
+		adj.iter().enumerate().for_each(|(i_node, i_adj)| {
+			if node_levels[i_node] >= i_level {
+				adj_id_map.push(R::from_usize(found_nodes).unwrap());
+				found_nodes += 1;
+				graphs[i_level].add_node_with_capacity(i_adj.len());
+				if i_level == 1 {
+					local_id_maps[0].push(R::from_usize(i_node).unwrap());
+					global_id_maps[0].push(R::from_usize(i_node).unwrap());
+				} else if i_level > 1 {
+					let next_layer_id = local_id_maps[i_level-2].len()-1;
+					local_id_maps[i_level-1].push(R::from_usize(next_layer_id).unwrap());
+					global_id_maps[i_level-1].push(R::from_usize(i_node).unwrap());
+				}
+			} else {
+				adj_id_map.push(R::max_value());
+			}
+		});
+		adj.iter().enumerate().for_each(|(i_node, i_adj)| {
+			i_adj.iter().for_each(|&j_node| {
+				assert!(adj_id_map[i_node] < R::max_value());
+				assert!(adj_id_map[j_node] < R::max_value());
+				graphs[i_level].add_edge(adj_id_map[i_node], adj_id_map[j_node]);
+			})
+		});
+	});
+	/* Ensure that the highest level graph is actually occupied */
+	while graphs[graphs.len()-1].n_vertices() == 0 {
+		graphs.pop();
+		local_id_maps.pop();
+		global_id_maps.pop();
+	}
+	/* Translate entry point to local ID in top level graph */
+	let entry_point = R::from(entry_point).unwrap();
+	let entry_point = global_id_maps[global_id_maps.len()-1].iter().position(|&x| x == entry_point).unwrap();
+	let entry_point = R::from(entry_point).unwrap();
+	/* Return the loaded values */
+	(data, graphs, local_id_maps, global_id_maps, entry_point)
+}
+pub fn load_hnswlib<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> GreedyLayeredGraphIndex<R, F, SquaredEuclideanDistance<F>, Array2<F>, DirLoLGraph<R>>{
+	let (data, graphs, local_id_maps, global_id_maps, entry_point) = load_hnswlib_parts(file);
+	GreedyLayeredGraphIndex::new(
+		data,
+		graphs,
+		local_id_maps,
+		global_id_maps,
+		SquaredEuclideanDistance::new(),
+		1,
+		Some(vec![entry_point])
+	)
+}
+pub fn load_hnswlib_capped<R: SyncUnsignedInteger, F: SyncFloat>(file: &str, max_frontier_size: usize) -> GreedyCappedLayeredGraphIndex<R, F, SquaredEuclideanDistance<F>, Array2<F>, DirLoLGraph<R>>{
+	let (data, graphs, local_id_maps, global_id_maps, entry_point) = load_hnswlib_parts(file);
+	GreedyCappedLayeredGraphIndex::new(
+		data,
+		graphs,
+		local_id_maps,
+		global_id_maps,
+		SquaredEuclideanDistance::new(),
+		1,
+		max_frontier_size,
+		Some(vec![entry_point]),
+)
+}
+
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -2546,6 +2720,7 @@ mod tests {
 			SquaredEuclideanDistance::new(),
 			index1.higher_level_max_heap_size(),
 			3*k,
+			None,
 		);
 		/* Brute force queries */
 		let bruteforce_time = Instant::now();
@@ -2559,6 +2734,110 @@ mod tests {
 		let hnsw_time = Instant::now();
 		#[allow(unused)]
 		let (hnsw_ids2, hnsw_dists2) = index2.greedy_search_batch(&queries, k, k);
+		println!("HNSW queries 2: {:.2?}", hnsw_time.elapsed());
+		/* Compute and print recall */
+		let mut same = 0;
+		bruteforce_ids.axis_iter(Axis(0)).zip(hnsw_ids1.axis_iter(Axis(0))).for_each(|(bf, rnn)| {
+			let bf_set = bf.iter().collect::<std::collections::HashSet<_>>();
+			let hnsw_set = rnn.iter().collect::<std::collections::HashSet<_>>();
+			same += bf_set.intersection(&hnsw_set).count();
+		});
+		let recall = same as f32 / (nq * k) as f32;
+		println!("Recall 1: {:.2}%", recall*100f32);
+		let mut same = 0;
+		bruteforce_ids.axis_iter(Axis(0)).zip(hnsw_ids2.axis_iter(Axis(0))).for_each(|(bf, rnn)| {
+			let bf_set = bf.iter().collect::<std::collections::HashSet<_>>();
+			let hnsw_set = rnn.iter().collect::<std::collections::HashSet<_>>();
+			same += bf_set.intersection(&hnsw_set).count();
+		});
+		let recall = same as f32 / (nq * k) as f32;
+		println!("Recall 2: {:.2}%", recall*100f32);
+	}
+
+
+	#[test]
+	fn hnsw_probs_test() {
+		/* Limit global thread pool size */
+		// rayon::ThreadPoolBuilder::new().num_threads(16).build_global().unwrap();
+		/* Parameters */
+		let (nd, nq, d, k, search_heap_size) = (100_000, 1000, 50, 1, 10);
+		let euc = SquaredEuclideanDistance::new();
+		/* Data initialization */
+		let init_time = Instant::now();
+		type R = usize;
+		type F = f32;
+		type Dist = SquaredEuclideanDistance<F>;
+		let data: Array2<F> = if 0>0 { /* Normal distribution */
+			let rng = Normal::new(0.0, 1.0).unwrap();
+			Array2::from_shape_fn((nd, d), |_| rng.sample(&mut rand::thread_rng()))
+		} else { /* Uniform distribution */
+			let rng = Uniform::new(0.0, 1.0);
+			Array2::from_shape_fn((nd, d), |_| rng.sample(&mut rand::thread_rng()))
+		};
+		let queries = data.slice_axis(Axis(0), Slice::from(0..nq));
+		println!("Data initialization: {:.2?}", init_time.elapsed());
+		/* Build and translate RNN Graph */
+		let build_time = Instant::now();
+		let dist = Dist::new();
+		let params = HNSWParams::new()
+			.with_n_parallel_burnin(1000)
+			.with_insert_heuristic(false)
+			.with_insert_heuristic_extend(false)
+			.with_higher_max_degree(20)
+			.with_lowest_max_degree(20)
+			.with_max_build_heap_size(500)
+			.with_max_build_frontier_size(None)
+			.with_level_norm_param_override(Some(0.5))
+			.with_insert_minibatch_size(1000)
+			.with_max_layers(1)
+			.with_n_rounds(3)
+		;
+		type BuilderType = HNSWParallelHeapBuilder<R,F,Dist>;
+		let index1 = BuilderType::build(data.view(), dist, params, 1);
+		println!("Graph construction ({:?}): {:.2?}", std::any::type_name::<BuilderType>(), build_time.elapsed());
+		if 1>0 { /* Verify graphs */
+			(0..index1.layer_count()).for_each(|i_layer| {
+				let graph = &index1.graphs()[i_layer];
+				/* Verify no duplicate edges, loops, or "escaping" edges */
+				(0..graph.n_vertices()).for_each(|i| {
+					let neighbors = graph.view_neighbors(i);
+					assert!(neighbors.len() <= if i_layer==0 {params.lowest_max_degree} else {params.higher_max_degree}, "Too many neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors.len());
+					assert_eq!(neighbors.iter().collect::<HashSet<_>>().len(), neighbors.len(), "Duplicate neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
+					assert!(neighbors.iter().all(|&j| j!=i), "Loop in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
+					assert!(neighbors.iter().all(|&j| j < graph.n_vertices()), "Escaping edge in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
+				});
+			});
+			println!("Graph sizes: {:.2?}", (0..index1.layer_count()).map(|i_layer| {
+				let graph = &index1.graphs()[i_layer];
+				graph.n_vertices()
+			}).collect::<Vec<_>>());
+			println!("Average out degrees: {:.2?}", (0..index1.layer_count()).map(|i_layer| {
+				let graph = &index1.graphs()[i_layer];
+				graph.n_edges() as f32 / (graph.n_vertices() as f32)
+			}).collect::<Vec<_>>());
+		}
+		let index2 = GreedyCappedLayeredGraphIndex::new(
+			data.view(),
+			index1.graphs().iter().map(|g|g.as_dir_lol_graph()).collect(),
+			(1..index1.graphs().len()).map(|i| index1.get_local_layer_ids(i).unwrap().clone()).collect(),
+			(1..index1.graphs().len()).map(|i| index1.get_global_layer_ids(i).unwrap().clone()).collect(),
+			SquaredEuclideanDistance::new(),
+			index1.higher_level_max_heap_size(),
+			3*k,
+			None,
+		);
+		/* Brute force queries */
+		let bruteforce_time = Instant::now();
+		let (bruteforce_ids, _) = bruteforce_neighbors(&data, &queries, &euc, k);
+		println!("Brute force queries: {:.2?}", bruteforce_time.elapsed());
+		/* HNSW queries */
+		let hnsw_time = Instant::now();
+		#[allow(unused)]
+		let (hnsw_ids1, hnsw_dists1) = index1.greedy_search_batch(&queries, k, search_heap_size);
+		println!("HNSW queries 1: {:.2?}", hnsw_time.elapsed());
+		let hnsw_time = Instant::now();
+		#[allow(unused)]
+		let (hnsw_ids2, hnsw_dists2) = index2.greedy_search_batch(&queries, k, search_heap_size);
 		println!("HNSW queries 2: {:.2?}", hnsw_time.elapsed());
 		/* Compute and print recall */
 		let mut same = 0;

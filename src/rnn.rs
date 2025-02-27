@@ -55,6 +55,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat> Graph<R> for RNNBuildGraph<R,F> {
 		let vertex = unsafe{vertex.to_usize().unwrap_unchecked()};
 		self.adjacency[vertex].iter().map(|&(_,v,_)| v).collect()
 	}
+	fn foreach_neighbor<Fun: FnMut(&R)>(&self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|v|f(&v.1));
+	}
+	fn foreach_neighbor_mut<Fun: FnMut(&mut R)>(&mut self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|v|f(&mut v.1));
+	}
 	fn add_node(&mut self) {
 		self.adjacency.push(Vec::new());
 	}
@@ -92,6 +98,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat> WeightedGraph<R,F> for RNNBuildGraph<
 	}
 	fn neighbors_with_zipped_weights(&self, vertex: R) -> Vec<(F,R)> {
 		self.adjacency[vertex.to_usize().unwrap()].iter().map(|&(v,w,_)| (v,w)).collect()
+	}
+	fn foreach_neighbor_with_zipped_weight<Fun: FnMut(&F, &R)>(&self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|v| f(&v.0,&v.1));
+	}
+	fn foreach_neighbor_with_zipped_weight_mut<Fun: FnMut(&mut F, &mut R)>(&mut self, vertex: R, mut f: Fun) {
+		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|v| f(&mut v.0,&mut v.1));
 	}
 }
 
@@ -228,7 +240,7 @@ fn make_greedy_index<
 	M: MatrixDataSource<F>,
 	Dist: Distance<F>,
 >(graph: RNNBuildGraph<R,F>, mat: M, dist: Dist) -> GreedySingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
-	GreedySingleGraphIndex::new(mat, graph.as_dir_lol_graph(), dist)
+	GreedySingleGraphIndex::new(mat, graph.as_dir_lol_graph(), dist, None)
 }
 #[inline(always)]
 fn make_greedy_capped_index<
@@ -237,7 +249,7 @@ fn make_greedy_capped_index<
 	M: MatrixDataSource<F>,
 	Dist: Distance<F>,
 >(graph: RNNBuildGraph<R,F>, mat: M, dist: Dist, max_frontier_size: usize) -> GreedyCappedSingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
-	GreedyCappedSingleGraphIndex::new(mat, graph.as_dir_lol_graph(), dist, max_frontier_size)
+	GreedyCappedSingleGraphIndex::new(mat, graph.as_dir_lol_graph(), dist, max_frontier_size, None)
 }
 #[inline(always)]
 fn tri_to_cos<F: Float>(uv: F, uw: F, vw: F, dist_is_sq: bool) -> F {
@@ -534,7 +546,7 @@ pub struct RNNEgoDescentBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Dist
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNEgoDescentBuilder<R, F, Dist> {
 	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
-		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum());
+		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum::<usize>());
 		println!("After initialization, Nodes: {:?}, Edges: {:?}", self.graph.n_vertices(), self.graph.n_edges());
 		(0..self.params.n_loops).for_each(|_i| {
 			if _i > 0 {
@@ -1046,7 +1058,7 @@ pub struct SENEgoDescentBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Dist
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> SENEgoDescentBuilder<R, F, Dist> {
 	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
-		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum());
+		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum::<usize>());
 		println!("After initialization, Nodes: {:?}, Edges: {:?}", self.graph.n_vertices(), self.graph.n_edges());
 		let true_radius = self.params.radius;
 		(0..self.params.n_loops).for_each(|_i| {
@@ -1455,6 +1467,7 @@ mod tests {
 			index1.graph().as_dir_lol_graph(),
 			SquaredEuclideanDistance::new(),
 			3*k,
+			None,
 		);
 		/* Brute force queries */
 		let bruteforce_time = Instant::now();
