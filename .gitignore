@@ -2,6 +2,7 @@
 Cargo.lock
 target
 lib
+pyenv
 
 *.sh
 flamegraph.svg

@@ -42,45 +42,64 @@ impl<R: UnsignedInteger, F: Float> HNSWHeapBuildGraph<R,F> {
 	}
 }
 impl<R: UnsignedInteger, F: Float> Graph<R> for HNSWHeapBuildGraph<R,F> {
+	#[inline(always)]
 	fn reserve(&mut self, n_vertices: usize) {
 		self.adjacency.reserve(n_vertices);
 	}
+	#[inline(always)]
 	fn n_vertices(&self) -> usize {
 		self.adjacency.len()
 	}
+	#[inline(always)]
 	fn n_edges(&self) -> usize {
 		self.n_edges
 	}
+	#[inline(always)]
 	fn neighbors(&self, vertex: R) -> Vec<R> {
 		self.adjacency[vertex.to_usize().unwrap()].iter().map(|&(_,v)| v).collect()
 	}
+	#[inline(always)]
 	fn foreach_neighbor<Fun: FnMut(&R)>(&self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|v|f(&v.1));
 	}
+	#[inline(always)]
 	fn foreach_neighbor_mut<Fun: FnMut(&mut R)>(&mut self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|v|f(&mut v.1));
 	}
+	#[inline(always)]
+	fn iter_neighbors<'a>(&'a self, vertex: R) -> impl Iterator<Item=&'a R> {
+		unsafe {
+			self.adjacency.get_unchecked(vertex.to_usize().unwrap_unchecked()).iter().map(|v|&v.1)
+		}
+	}
+	#[inline(always)]
 	fn add_node(&mut self) {
 		self.adjacency.push(MaxHeap::new());
 	}
+	#[inline(always)]
 	fn add_node_with_capacity(&mut self, capacity: usize) {
 		self.adjacency.push(MaxHeap::with_capacity(capacity));
 	}
+	#[inline(always)]
 	fn add_edge(&mut self, _vertex1: R, _vertex2: R) {
 		panic!("Cannot add edge without weight to a weighted graph");
 	}
+	#[inline(always)]
 	fn remove_edge_by_index(&mut self, _vertex: R, _index: usize) {
 		panic!("Cannot remove edge by index in heap-based graph");
 	}
 }
 impl<R: UnsignedInteger, F: Float> WeightedGraph<R,F> for HNSWHeapBuildGraph<R,F> {
+	#[inline(always)]
 	fn edge_weight(&self, vertex1: R, vertex2: R) -> F {
 		self.adjacency[vertex1.to_usize().unwrap()].iter().find(|&&(_,v)| v == vertex2).unwrap().0
 	}
+	#[inline(always)]
 	fn add_edge_with_weight(&mut self, vertex1: R, vertex2: R, weight: F) {
 		self.adjacency[vertex1.to_usize().unwrap()].push(weight, vertex2);
 		self.n_edges += 1;
 	}
+	#[inline(always)]
 	fn neighbors_with_weights(&self, vertex: R) -> (Vec<F>, Vec<R>) {
 		let mut neighbors = Vec::new();
 		let mut weights = Vec::new();
@@ -90,23 +109,29 @@ impl<R: UnsignedInteger, F: Float> WeightedGraph<R,F> for HNSWHeapBuildGraph<R,F
 		}
 		(weights, neighbors)
 	}
+	#[inline(always)]
 	fn neighbors_with_zipped_weights(&self, vertex: R) -> Vec<(F,R)> {
 		self.adjacency[vertex.to_usize().unwrap()].iter().map(|&v|v).collect()
 	}
+	#[inline(always)]
 	fn foreach_neighbor_with_zipped_weight<Fun: FnMut(&F, &R)>(&self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|&v| f(&v.0,&v.1));
 	}
+	#[inline(always)]
 	fn foreach_neighbor_with_zipped_weight_mut<Fun: FnMut(&mut F, &mut R)>(&mut self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|(w,v)| f(w,v));
 	}
+	#[inline(always)]
 	fn as_viewable_weighted_adj_graph(&self) -> Option<&impl ViewableWeightedAdjGraph<R,F>> {
 		Some(self)
 	}
 }
 impl<R: UnsignedInteger, F: Float> ViewableWeightedAdjGraph<R,F> for HNSWHeapBuildGraph<R,F> {
+	#[inline(always)]
 	fn view_neighbors(&self, vertex: R) -> &[(F,R)] {
 		self.adjacency[vertex.to_usize().unwrap()].as_slice()
 	}
+	#[inline(always)]
 	fn view_neighbors_mut(&mut self, vertex: R) -> &mut [(F,R)] {
 		self.adjacency[vertex.to_usize().unwrap()].as_mut_slice()
 	}
@@ -339,6 +364,7 @@ param_struct!(HNSWParams[Copy, Clone] {
 	level_norm_param_override: Option<f32> = None,
 	insert_heuristic: bool = true,
 	insert_heuristic_extend: bool = true,
+	post_prune_heuristic: bool = false,
 	insert_minibatch_size: usize = 100,
 	n_rounds: usize = 1,
 });
@@ -1173,7 +1199,10 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 					});
 				}
 			});
-		})
+		});
+		if self.params.post_prune_heuristic {
+			self.heuristic_post_prune(mat);
+		}
 	}
 	fn insert<M: MatrixDataSource<F>+Sync>(&mut self, i_round: usize, mat: &M, mut i: usize, i_global: usize, level: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
 		/* We just assume that the global index 1 is the root entry point */
@@ -1302,6 +1331,60 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 			});
 		}
+	}
+	#[allow(unused)]
+	fn heuristic_post_prune<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
+		let (n_data, max_cos, dist_is_sq) = (self.n_data, F::from(0.55).unwrap(), true);
+		let n_threads = self.n_threads;
+		let dist_fun = |a,b| self._get_dist(mat,a,b);
+		let unsafe_self_ref = std::ptr::from_ref(self) as *mut Self;
+		let graphs = unsafe{&mut (*unsafe_self_ref).graphs};
+		graphs.iter_mut()
+		.enumerate()
+		.for_each(|(i_layer, graph)| {
+			let n_nodes = graph.n_vertices();
+			let thread_chunk_size = (n_nodes+n_threads-1)/n_threads;
+			let global_ids = if i_layer > 0 { Some(&self.global_layer_ids[i_layer-1]) } else { None };
+
+			(0..n_nodes).step_by(thread_chunk_size)
+			.map(|start| start..(start+thread_chunk_size).min(n_nodes))
+			.par_bridge()
+			.for_each(|chunk| {
+				let unsafe_graph_ref = std::ptr::from_ref(graph) as *mut HNSWHeapBuildGraph<R,F>;
+			
+				let mut old_neighbors: Vec<(F,R)> = vec![];
+				unsafe{
+					chunk.for_each(|i| {
+						let (iusize, i) = (i, R::from_usize(i).unwrap_unchecked());
+						let i_adj: &mut MaxHeap<F,R> = (*unsafe_graph_ref).view_neighbors_heap_mut(i);
+
+						old_neighbors.clear();
+						let n_elem = i_adj.size();
+						old_neighbors.reserve(n_elem);
+						old_neighbors.set_len(n_elem);
+						old_neighbors.iter_mut().rev().zip(i_adj.sorted_iter()).for_each(|(x,y)| *x = y);
+		
+						old_neighbors.iter().for_each(|&(ijdist, j)| {
+							let jusize = R::to_usize(&j).unwrap_unchecked();
+							let jglobal = if global_ids.is_some() { global_ids.unwrap_unchecked()[jusize].to_usize().unwrap_unchecked() } else {jusize};
+							let mut keep_neighbor = true;
+							for &(ikdist, k) in i_adj.iter() {
+								let kusize = R::to_usize(&k).unwrap_unchecked();
+								let kglobal = if global_ids.is_some() { global_ids.unwrap_unchecked()[kusize].to_usize().unwrap_unchecked() } else {kusize};
+								let jkdist: F = dist_fun(jglobal, kglobal);
+								if jkdist < ikdist {
+									keep_neighbor = false;
+									break
+								}
+							}
+							if keep_neighbor {
+								i_adj.push(ijdist,j);
+							}
+						});
+					});
+				}
+			})
+		});
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWParallelHeapBuilder<R, F, Dist> {

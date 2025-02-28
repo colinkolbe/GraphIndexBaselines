@@ -13,6 +13,7 @@ pub struct RNNBuildGraph<R: SyncUnsignedInteger, F: SyncFloat> {
 	n_edges: usize
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat> RNNBuildGraph<R,F> {
+	#[inline(always)]
 	pub fn new() -> Self {
 		Self{adjacency: vec![], n_edges:0}
 	}
@@ -24,52 +25,72 @@ impl<R: SyncUnsignedInteger, F: SyncFloat> RNNBuildGraph<R,F> {
 			self.adjacency[v1usize][unsafe{neighbor_idx.unwrap_unchecked()}].2 = flag;
 		}
 	}
+	#[inline(always)]
 	fn set_flag_all_neighbors(&mut self, vertex: R, flag: bool) {
 		let vertex = unsafe{vertex.to_usize().unwrap_unchecked()};
 		self.adjacency[vertex].iter_mut().for_each(|(_,_,f)| *f = flag);
 	}
+	#[inline(always)]
 	fn get_adj(&self, vertex: R) -> &Vec<(F,R,bool)> {
 		let vertex = unsafe{vertex.to_usize().unwrap_unchecked()};
 		&self.adjacency[vertex]
 	}
+	#[inline(always)]
 	fn get_adj_mut(&mut self, vertex: R) -> &mut Vec<(F,R,bool)> {
 		let vertex = unsafe{vertex.to_usize().unwrap_unchecked()};
 		&mut self.adjacency[vertex]
 	}
+	#[inline(always)]
 	fn clear_adj(&mut self, vertex: R) {
 		let vertex = unsafe{vertex.to_usize().unwrap_unchecked()};
 		self.adjacency[vertex].clear();
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat> Graph<R> for RNNBuildGraph<R,F> {
+	#[inline(always)]
 	fn reserve(&mut self, n_vertices: usize) {
 		self.adjacency.reserve(n_vertices);
 	}
+	#[inline(always)]
 	fn n_vertices(&self) -> usize {
 		self.adjacency.len()
 	}
+	#[inline(always)]
 	fn n_edges(&self) -> usize {
 		self.n_edges
 	}
+	#[inline(always)]
 	fn neighbors(&self, vertex: R) -> Vec<R> {
 		let vertex = unsafe{vertex.to_usize().unwrap_unchecked()};
 		self.adjacency[vertex].iter().map(|&(_,v,_)| v).collect()
 	}
+	#[inline(always)]
 	fn foreach_neighbor<Fun: FnMut(&R)>(&self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|v|f(&v.1));
 	}
+	#[inline(always)]
 	fn foreach_neighbor_mut<Fun: FnMut(&mut R)>(&mut self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|v|f(&mut v.1));
 	}
+	#[inline(always)]
+	fn iter_neighbors<'a>(&'a self, vertex: R) -> impl Iterator<Item=&'a R> {
+		unsafe {
+			self.adjacency.get_unchecked(vertex.to_usize().unwrap_unchecked()).iter().map(|v|&v.1)
+		}
+	}
+	#[inline(always)]
 	fn add_node(&mut self) {
 		self.adjacency.push(Vec::new());
 	}
+	#[inline(always)]
 	fn add_node_with_capacity(&mut self, capacity: usize) {
 		self.adjacency.push(Vec::with_capacity(capacity));
 	}
+	#[inline(always)]
 	fn add_edge(&mut self, _vertex1: R, _vertex2: R) {
 		panic!("Cannot add edge without weight to a weighted graph");
 	}
+	#[inline(always)]
 	fn remove_edge_by_index(&mut self, vertex: R, index: usize) {
 		let vertex = unsafe{vertex.to_usize().unwrap_unchecked()};
 		self.adjacency[vertex].swap_remove(index);
@@ -77,16 +98,19 @@ impl<R: SyncUnsignedInteger, F: SyncFloat> Graph<R> for RNNBuildGraph<R,F> {
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat> WeightedGraph<R,F> for RNNBuildGraph<R,F> {
+	#[inline(always)]
 	fn edge_weight(&self, vertex1: R, vertex2: R) -> F {
 		let vertex1 = unsafe{vertex1.to_usize().unwrap_unchecked()};
 		self.adjacency[vertex1].iter().find(|&&(_,v,_)| v == vertex2).unwrap().0
 	}
+	#[inline(always)]
 	fn add_edge_with_weight(&mut self, vertex1: R, vertex2: R, weight: F) {
 		let vertex1 = unsafe{vertex1.to_usize().unwrap_unchecked()};
 		self.adjacency[vertex1].push((weight,vertex2,true));
 		debug_assert!(self.adjacency[vertex1][self.adjacency[vertex1].len()-1] == (weight, vertex2, true));
 		self.n_edges += 1;
 	}
+	#[inline(always)]
 	fn neighbors_with_weights(&self, vertex: R) -> (Vec<F>, Vec<R>) {
 		let mut neighbors = Vec::new();
 		let mut weights = Vec::new();
@@ -96,12 +120,15 @@ impl<R: SyncUnsignedInteger, F: SyncFloat> WeightedGraph<R,F> for RNNBuildGraph<
 		}
 		(weights, neighbors)
 	}
+	#[inline(always)]
 	fn neighbors_with_zipped_weights(&self, vertex: R) -> Vec<(F,R)> {
 		self.adjacency[vertex.to_usize().unwrap()].iter().map(|&(v,w,_)| (v,w)).collect()
 	}
+	#[inline(always)]
 	fn foreach_neighbor_with_zipped_weight<Fun: FnMut(&F, &R)>(&self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter().for_each(|v| f(&v.0,&v.1));
 	}
+	#[inline(always)]
 	fn foreach_neighbor_with_zipped_weight_mut<Fun: FnMut(&mut F, &mut R)>(&mut self, vertex: R, mut f: Fun) {
 		self.adjacency[vertex.to_usize().unwrap()].iter_mut().for_each(|v| f(&mut v.0,&mut v.1));
 	}
