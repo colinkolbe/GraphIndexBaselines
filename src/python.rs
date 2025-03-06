@@ -67,22 +67,214 @@ impl GraphStats {
 	}
 }
 
+
+type GSIndex<M> = GreedySingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
+type GCSIndex<M> = GreedyCappedSingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
+type GLIndex<M> = GreedyLayeredGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
+type GCLIndex<M> = GreedyCappedLayeredGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
+
+
+pub enum IndexOneOf<A: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>, B: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>> {
+	A(A),
+	B(B),
+	None,
+}
+#[allow(dead_code)]
+impl<A: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>, B: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>> IndexOneOf<A,B> {
+	fn greedy_search(&self, queries: &ArrayView1<f32>, k: usize, max_heap_size: usize) -> (Array1<usize>, Array1<f32>) {
+		match self {
+				IndexOneOf::A(a) => a.greedy_search(queries, k, max_heap_size, &mut a._new_search_cache(max_heap_size)),
+				IndexOneOf::B(b) => b.greedy_search(queries, k, max_heap_size, &mut b._new_search_cache(max_heap_size)),
+				IndexOneOf::None => panic!(),
+		}
+	}
+	fn greedy_search_batch(&self, queries: &ArrayView2<f32>, k: usize, max_heap_size: usize) -> (Array2<usize>, Array2<f32>) {
+		match self {
+				IndexOneOf::A(a) => a.greedy_search_batch(queries, k, max_heap_size),
+				IndexOneOf::B(b) => b.greedy_search_batch(queries, k, max_heap_size),
+				IndexOneOf::None => panic!(),
+		}
+	}
+	fn as_a(&self) -> Option<&A> {
+		match self {
+			IndexOneOf::A(a) => Some(a),
+			IndexOneOf::B(_) => None,
+			IndexOneOf::None => None,
+		}
+	}
+	fn as_b(&self) -> Option<&B> {
+		match self {
+			IndexOneOf::A(_) => None,
+			IndexOneOf::B(b) => Some(b),
+			IndexOneOf::None => None,
+		}
+	}
+	fn as_a_mut(&mut self) -> Option<&mut A> {
+		match self {
+			IndexOneOf::A(a) => Some(a),
+			IndexOneOf::B(_) => None,
+			IndexOneOf::None => None,
+		}
+	}
+	fn as_b_mut(&mut self) -> Option<&mut B> {
+		match self {
+			IndexOneOf::A(_) => None,
+			IndexOneOf::B(b) => Some(b),
+			IndexOneOf::None => None,
+		}
+	}
+	fn is_a(&self) -> bool {
+		match self {
+			IndexOneOf::A(_) => true,
+			IndexOneOf::B(_) => false,
+			IndexOneOf::None => false,
+		}
+	}
+	fn is_b(&self) -> bool {
+		match self {
+			IndexOneOf::A(_) => false,
+			IndexOneOf::B(_) => true,
+			IndexOneOf::None => false,
+		}
+	}
+	fn into_a<F: FnOnce(B) -> A>(self, fun: F) -> Self {
+		match self {
+			IndexOneOf::A(_) => self,
+			IndexOneOf::B(b) => IndexOneOf::A(fun(b)),
+			IndexOneOf::None => self,
+		}
+	}
+	fn into_b<F: FnOnce(A) -> B>(self, fun: F) -> Self {
+		match self {
+			IndexOneOf::A(a) => IndexOneOf::B(fun(a)),
+			IndexOneOf::B(_) => self,
+			IndexOneOf::None => self,
+		}
+	}
+}
+
+
+macro_rules! generic_graph_index_funs {
+	($type: ident) => {
+		#[pymethods]
+		impl $type {
+			#[pyo3(signature = (query, k, max_heap_size=None))]
+			fn knn_query<'py>(&self, py: Python<'py>, query: Bound<'py, PyArray1<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<usize>>, Bound<'py,PyArray1<f32>>) {
+				unsafe {
+					let (ids, dists) = self.index.greedy_search(
+						&arrview1_py_to_rust(query.as_array()),
+						k,
+						max_heap_size.unwrap_or(2*k),
+					);
+					(
+						PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
+						PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
+					)
+				}
+			}
+			#[pyo3(signature = (queries, k, max_heap_size=None))]
+			fn knn_query_batch<'py>(&self, py: Python<'py>, queries: Bound<'py, PyArray2<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<usize>>, Bound<'py,PyArray2<f32>>) {
+				unsafe {
+					let (ids, dists) = self.index.greedy_search_batch(
+						&arrview2_py_to_rust(queries.as_array()),
+						k,
+						max_heap_size.unwrap_or(2*k),
+					);
+					(
+						PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
+						PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
+					)
+				}
+			}
+			#[getter]
+			fn get_max_frontier_size(&self) -> Option<usize> {
+				self.max_frontier_size
+			}
+			#[setter]
+			fn set_max_frontier_size(&mut self, max_frontier_size: Option<usize>) {
+				self.max_frontier_size = max_frontier_size;
+				if self.max_frontier_size.is_none() {
+					if self.index.is_b() {
+						let mut index = IndexOneOf::None;
+						std::mem::swap(&mut self.index, &mut index);
+						let mut index = index.into_a(|index| index.into_uncapped());
+						std::mem::swap(&mut self.index, &mut index);
+					}
+				} else {
+					if self.index.is_a() {
+						let mut index = IndexOneOf::None;
+						std::mem::swap(&mut self.index, &mut index);
+						let mut index = index.into_b(|index| index.into_capped(max_frontier_size.unwrap()));
+						std::mem::swap(&mut self.index, &mut index);
+					} else {
+						self.index.as_b_mut().unwrap().set_max_frontier_size(max_frontier_size.unwrap());
+					}
+				}
+			}
+		}
+	};
+	(layered $type: ident) => {
+		generic_graph_index_funs!($type);
+		#[pymethods]
+		impl $type {
+			fn get_graph_stats(&self) -> Vec<GraphStats> {
+				match &self.index {
+					IndexOneOf::A(index) => index.graphs().iter().map(|g| GraphStats::from_graph(g)).collect(),
+					IndexOneOf::B(index) => index.graphs().iter().map(|g| GraphStats::from_graph(g)).collect(),
+					IndexOneOf::None => panic!(),
+				}
+			}
+			fn get_neighbors(&self, layer: usize, node: usize) -> Vec<usize> {
+				match &self.index {
+					IndexOneOf::A(index) => index.graphs()[layer].neighbors(node),
+					IndexOneOf::B(index) => index.graphs()[layer].neighbors(node),
+					IndexOneOf::None => panic!(),
+				}
+			}
+			fn get_next_layer_id(&self, layer: usize, node: usize) -> usize {
+				if layer == 0 { return node; }
+				match &self.index {
+					IndexOneOf::A(index) => index.get_local_layer_ids(layer).unwrap()[node],
+					IndexOneOf::B(index) => index.get_local_layer_ids(layer).unwrap()[node],
+					IndexOneOf::None => panic!(),
+				}
+			}
+			fn get_global_id(&self, layer: usize, node: usize) -> usize {
+				if layer == 0 { return node; }
+				match &self.index {
+					IndexOneOf::A(index) => index.get_global_layer_ids(layer).unwrap()[node],
+					IndexOneOf::B(index) => index.get_global_layer_ids(layer).unwrap()[node],
+					IndexOneOf::None => panic!(),
+				}
+			}
+		}
+	};
+	(single $type: ident) => {
+		generic_graph_index_funs!($type);
+		#[pymethods]
+		impl $type {
+			fn get_graph_stats(&self) -> GraphStats {
+				match &self.index {
+					IndexOneOf::A(index) => GraphStats::from_graph(index.graph()),
+					IndexOneOf::B(index) => GraphStats::from_graph(index.graph()),
+					IndexOneOf::None => panic!(),
+				}
+			}
+			fn get_neighbors(&self, node: usize) -> Vec<usize> {
+				match &self.index {
+					IndexOneOf::A(index) => index.graph().neighbors(node),
+					IndexOneOf::B(index) => index.graph().neighbors(node),
+					IndexOneOf::None => panic!(),
+				}
+			}
+		}
+	};
+}
+
+
 #[pyclass]
 pub struct PyHNSW {
-	index: Option<GreedyLayeredGraphIndex<
-		usize,
-		f32,
-		SquaredEuclideanDistance<f32>,
-		ArrayView2<'static, f32>,
-		DirLoLGraph<usize>,
-	>>,
-	capped_index: Option<GreedyCappedLayeredGraphIndex<
-		usize,
-		f32,
-		SquaredEuclideanDistance<f32>,
-		ArrayView2<'static, f32>,
-		DirLoLGraph<usize>,
-	>>,
+	index: IndexOneOf<GLIndex<ArrayView2<'static,f32>>, GCLIndex<ArrayView2<'static,f32>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
@@ -128,118 +320,17 @@ impl PyHNSW {
 			);
 			if max_frontier_size.is_some() {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
-				PyHNSW { index: None, capped_index: Some(capped_index), max_frontier_size: max_frontier_size }
+				PyHNSW { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size }
 			} else {
-				PyHNSW { index: Some(index), capped_index: None, max_frontier_size: None }
+				PyHNSW { index: IndexOneOf::A(index), max_frontier_size: None }
 			}
-		}
-	}
-	#[pyo3(signature = (query, k, max_heap_size=None))]
-	fn knn_query<'py>(&self, py: Python<'py>, query: Bound<'py, PyArray1<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<usize>>, Bound<'py,PyArray1<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[pyo3(signature = (queries, k, max_heap_size=None))]
-	fn knn_query_batch<'py>(&self, py: Python<'py>, queries: Bound<'py, PyArray2<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<usize>>, Bound<'py,PyArray2<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[getter]
-	fn get_max_frontier_size(&self) -> Option<usize> {
-		self.max_frontier_size
-	}
-	#[setter]
-	fn set_max_frontier_size(&mut self, max_frontier_size: Option<usize>) {
-		self.max_frontier_size = max_frontier_size;
-		if self.max_frontier_size.is_none() && self.index.is_none() {
-			let mut capped_index = None;
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-			let mut uncapped_index = Some(capped_index.unwrap().into_uncapped());
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-		} else if self.max_frontier_size.is_some() && self.capped_index.is_none() {
-			let mut uncapped_index = None;
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-			let mut capped_index = Some(uncapped_index.unwrap().into_capped(self.max_frontier_size.unwrap()));
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-		}
-		if self.max_frontier_size.is_some() {
-			self.capped_index.as_mut().unwrap().max_frontier_size = self.max_frontier_size.unwrap();
-		}
-	}
-	fn get_graph_stats(&self) -> Vec<GraphStats> {
-		if self.index.is_some() {
-			self.index.as_ref().unwrap().graphs().iter().map(|g| GraphStats::from_graph(g)).collect()
-		} else {
-			self.capped_index.as_ref().unwrap().graphs().iter().map(|g| GraphStats::from_graph(g)).collect()
 		}
 	}
 }
-
-
+generic_graph_index_funs!(layered PyHNSW);
 #[pyclass]
 pub struct OwningPyHNSW {
-	index: Option<GreedyLayeredGraphIndex<
-		usize,
-		f32,
-		SquaredEuclideanDistance<f32>,
-		Array2<f32>,
-		DirLoLGraph<usize>,
-	>>,
-	capped_index: Option<GreedyCappedLayeredGraphIndex<
-		usize,
-		f32,
-		SquaredEuclideanDistance<f32>,
-		Array2<f32>,
-		DirLoLGraph<usize>,
-	>>,
+	index: IndexOneOf<GLIndex<Array2<f32>>, GCLIndex<Array2<f32>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
@@ -285,116 +376,17 @@ impl OwningPyHNSW {
 			);
 			if max_frontier_size.is_some() {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
-				OwningPyHNSW { index: None, capped_index: Some(capped_index), max_frontier_size: max_frontier_size }
+				OwningPyHNSW { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size }
 			} else {
-				OwningPyHNSW { index: Some(index), capped_index: None, max_frontier_size: None }
+				OwningPyHNSW { index: IndexOneOf::A(index), max_frontier_size: None }
 			}
-		}
-	}
-	#[pyo3(signature = (query, k, max_heap_size=None))]
-	fn knn_query<'py>(&self, py: Python<'py>, query: Bound<'py, PyArray1<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<usize>>, Bound<'py,PyArray1<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[pyo3(signature = (queries, k, max_heap_size=None))]
-	fn knn_query_batch<'py>(&self, py: Python<'py>, queries: Bound<'py, PyArray2<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<usize>>, Bound<'py,PyArray2<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[getter]
-	fn get_max_frontier_size(&self) -> Option<usize> {
-		self.max_frontier_size
-	}
-	#[setter]
-	fn set_max_frontier_size(&mut self, max_frontier_size: Option<usize>) {
-		self.max_frontier_size = max_frontier_size;
-		if self.max_frontier_size.is_none() && self.index.is_none() {
-			let mut capped_index = None;
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-			let mut uncapped_index = Some(capped_index.unwrap().into_uncapped());
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-		} else if self.max_frontier_size.is_some() && self.capped_index.is_none() {
-			let mut uncapped_index = None;
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-			let mut capped_index = Some(uncapped_index.unwrap().into_capped(self.max_frontier_size.unwrap()));
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-		}
-		if self.max_frontier_size.is_some() {
-			self.capped_index.as_mut().unwrap().max_frontier_size = self.max_frontier_size.unwrap();
-		}
-	}
-	fn get_graph_stats(&self) -> Vec<GraphStats> {
-		if self.index.is_some() {
-			self.index.as_ref().unwrap().graphs().iter().map(|g| GraphStats::from_graph(g)).collect()
-		} else {
-			self.capped_index.as_ref().unwrap().graphs().iter().map(|g| GraphStats::from_graph(g)).collect()
 		}
 	}
 }
-
-#[pyfunction]
-#[pyo3(signature = (file, max_frontier_size=None))]
-pub fn load_hnswlib(file: &str, max_frontier_size: Option<usize>) -> OwningPyHNSW {
-	let index = crate::hnsw::load_hnswlib(file);
-	if max_frontier_size.is_none() {
-		OwningPyHNSW{index:Some(index), capped_index:None, max_frontier_size:None}
-	} else {
-		OwningPyHNSW{index:None, capped_index:Some(index.into_capped(max_frontier_size.unwrap())), max_frontier_size:max_frontier_size}
-	}
-}
-
+generic_graph_index_funs!(layered OwningPyHNSW);
 #[pyclass]
 pub struct PyRNNDescent {
-	index: Option<GreedySingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, ArrayView2<'static,f32>, DirLoLGraph<usize>>>,
-	capped_index: Option<GreedyCappedSingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, ArrayView2<'static,f32>, DirLoLGraph<usize>>>,
+	index: IndexOneOf<GSIndex<ArrayView2<'static,f32>>, GCSIndex<ArrayView2<'static,f32>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
@@ -424,106 +416,18 @@ impl PyRNNDescent {
 				params,
 			);
 			if max_frontier_size.is_none() {
-				PyRNNDescent { index: Some(index), capped_index: None, max_frontier_size: None }
+				PyRNNDescent { index: IndexOneOf::A(index), max_frontier_size: None }
 			} else {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
-				PyRNNDescent { index: None, capped_index: Some(capped_index), max_frontier_size: max_frontier_size }
+				PyRNNDescent { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size }
 			}
-		}
-	}
-	#[pyo3(signature = (query, k, max_heap_size=None))]
-	fn knn_query<'py>(&self, py: Python<'py>, query: Bound<'py, PyArray1<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<usize>>, Bound<'py,PyArray1<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[pyo3(signature = (queries, k, max_heap_size=None))]
-	fn knn_query_batch<'py>(&self, py: Python<'py>, queries: Bound<'py, PyArray2<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<usize>>, Bound<'py,PyArray2<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[getter]
-	fn get_max_frontier_size(&self) -> Option<usize> {
-		self.max_frontier_size
-	}
-	#[setter]
-	fn set_max_frontier_size(&mut self, max_frontier_size: Option<usize>) {
-		self.max_frontier_size = max_frontier_size;
-		if self.max_frontier_size.is_none() && self.index.is_none() {
-			let mut capped_index = None;
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-			let mut uncapped_index = Some(capped_index.unwrap().into_uncapped());
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-		} else if self.max_frontier_size.is_some() && self.capped_index.is_none() {
-			let mut uncapped_index = None;
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-			let mut capped_index = Some(uncapped_index.unwrap().into_capped(self.max_frontier_size.unwrap()));
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-		}
-		if self.max_frontier_size.is_some() {
-			self.capped_index.as_mut().unwrap().max_frontier_size = self.max_frontier_size.unwrap();
-		}
-	}
-	fn get_graph_stats(&self) -> GraphStats {
-		if self.index.is_some() {
-			GraphStats::from_graph(self.index.as_ref().unwrap().graph())
-		} else {
-			GraphStats::from_graph(self.capped_index.as_ref().unwrap().graph())
 		}
 	}
 }
-
+generic_graph_index_funs!(single PyRNNDescent);
 #[pyclass]
 pub struct PySENDescent {
-	index: Option<GreedySingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, ArrayView2<'static,f32>, DirLoLGraph<usize>>>,
-	capped_index: Option<GreedyCappedSingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, ArrayView2<'static,f32>, DirLoLGraph<usize>>>,
+	index: IndexOneOf<GSIndex<ArrayView2<'static,f32>>, GCSIndex<ArrayView2<'static,f32>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
@@ -561,99 +465,25 @@ impl PySENDescent {
 				params,
 			);
 			if max_frontier_size.is_none() {
-				PySENDescent { index: Some(index), capped_index: None, max_frontier_size: None }
+				PySENDescent { index: IndexOneOf::A(index), max_frontier_size: None }
 			} else {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
-				PySENDescent { index: None, capped_index: Some(capped_index), max_frontier_size: max_frontier_size }
+				PySENDescent { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size }
 			}
 		}
 	}
-	#[pyo3(signature = (query, k, max_heap_size=None))]
-	fn knn_query<'py>(&self, py: Python<'py>, query: Bound<'py, PyArray1<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<usize>>, Bound<'py,PyArray1<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search(
-					&arrview1_py_to_rust(query.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-					&mut index._new_search_cache(max_heap_size.unwrap_or(2*k)),
-				);
-				(
-					PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
-					PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[pyo3(signature = (queries, k, max_heap_size=None))]
-	fn knn_query_batch<'py>(&self, py: Python<'py>, queries: Bound<'py, PyArray2<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<usize>>, Bound<'py,PyArray2<f32>>) {
-		unsafe {
-			if self.index.is_some() {
-				let index = self.index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			} else {
-				let index = self.capped_index.as_ref().unwrap_unchecked();
-				let (ids, dists) = index.greedy_search_batch(
-					&arrview2_py_to_rust(queries.as_array()),
-					k,
-					max_heap_size.unwrap_or(2*k),
-				);
-				(
-					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
-					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
-				)
-			}
-		}
-	}
-	#[getter]
-	fn get_max_frontier_size(&self) -> Option<usize> {
-		self.max_frontier_size
-	}
-	#[setter]
-	fn set_max_frontier_size(&mut self, max_frontier_size: Option<usize>) {
-		self.max_frontier_size = max_frontier_size;
-		if self.max_frontier_size.is_none() && self.index.is_none() {
-			let mut capped_index = None;
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-			let mut uncapped_index = Some(capped_index.unwrap().into_uncapped());
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-		} else if self.max_frontier_size.is_some() && self.capped_index.is_none() {
-			let mut uncapped_index = None;
-			std::mem::swap(&mut self.index, &mut uncapped_index);
-			let mut capped_index = Some(uncapped_index.unwrap().into_capped(self.max_frontier_size.unwrap()));
-			std::mem::swap(&mut self.capped_index, &mut capped_index);
-		}
-		if self.max_frontier_size.is_some() {
-			self.capped_index.as_mut().unwrap().max_frontier_size = self.max_frontier_size.unwrap();
-		}
-	}
-	fn get_graph_stats(&self) -> GraphStats {
-		if self.index.is_some() {
-			GraphStats::from_graph(self.index.as_ref().unwrap().graph())
-		} else {
-			GraphStats::from_graph(self.capped_index.as_ref().unwrap().graph())
-		}
+}
+generic_graph_index_funs!(single PySENDescent);
+
+
+#[pyfunction]
+#[pyo3(signature = (file, max_frontier_size=None))]
+pub fn load_hnswlib(file: &str, max_frontier_size: Option<usize>) -> OwningPyHNSW {
+	let index = crate::hnsw::load_hnswlib(file);
+	if max_frontier_size.is_none() {
+		OwningPyHNSW{index:IndexOneOf::A(index), max_frontier_size:None}
+	} else {
+		OwningPyHNSW{index:IndexOneOf::B(index.into_capped(max_frontier_size.unwrap())), max_frontier_size:max_frontier_size}
 	}
 }
 
