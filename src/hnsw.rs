@@ -176,6 +176,76 @@ fn make_greedy_capped_index<
 	)
 }
 #[inline(always)]
+fn make_fat_greedy_index<
+	R: SyncUnsignedInteger,
+	F: SyncFloat,
+	M: MatrixDataSource<F>,
+	Dist: Distance<F>,
+	G: Graph<R>,
+>(graphs: Vec<G>, global_layer_ids: Vec<Vec<R>>, mat: M, dist: Dist, higher_level_max_heap_size: usize, higher_level_max_degree: usize, lowest_level_max_degree: usize) -> GreedyLayeredGraphIndex<R, F, Dist, M, FatDirGraph<R>> {
+	let top_entry_points = Some(vec![global_layer_ids.last().unwrap()[0]]);
+	let mut fat_graphs = Vec::new();
+	fat_graphs.push(graphs[0].as_fat_dir_graph(
+		None,
+		Some(mat.n_rows()),
+		Some(lowest_level_max_degree))
+	);
+	graphs.iter().skip(1)
+	.zip(global_layer_ids.into_iter())
+	.for_each(|(g, global_ids)| {
+		fat_graphs.push(g.as_fat_dir_graph(
+			Some(global_ids),
+			Some(mat.n_rows()),
+			Some(higher_level_max_degree)
+		))
+	});
+	GreedyLayeredGraphIndex::new(
+		mat,
+		fat_graphs,
+		Vec::new(),
+		Vec::new(),
+		dist,
+		higher_level_max_heap_size,
+		top_entry_points,
+	)
+}
+#[inline(always)]
+fn make_fat_greedy_capped_index<
+	R: SyncUnsignedInteger,
+	F: SyncFloat,
+	M: MatrixDataSource<F>,
+	Dist: Distance<F>,
+	G: Graph<R>,
+>(graphs: Vec<G>, global_layer_ids: Vec<Vec<R>>, mat: M, dist: Dist, higher_level_max_heap_size: usize, higher_level_max_degree: usize, lowest_level_max_degree: usize, max_frontier_size: usize) -> GreedyCappedLayeredGraphIndex<R, F, Dist, M, FatDirGraph<R>> {
+	let top_entry_points = Some(vec![global_layer_ids.last().unwrap()[0]]);
+	let mut fat_graphs = Vec::new();
+	fat_graphs.push(graphs[0].as_fat_dir_graph(
+		None,
+		Some(mat.n_rows()),
+		Some(lowest_level_max_degree))
+	);
+	graphs.iter().skip(1)
+	.zip(global_layer_ids.into_iter())
+	.for_each(|(g, global_ids)| {
+		fat_graphs.push(g.as_fat_dir_graph(
+			Some(global_ids),
+			Some(mat.n_rows()),
+			Some(higher_level_max_degree))
+		);
+	});
+	GreedyCappedLayeredGraphIndex::new(
+		mat,
+		fat_graphs,
+		Vec::new(),
+		Vec::new(),
+		dist,
+		higher_level_max_heap_size,
+		max_frontier_size,
+		top_entry_points,
+	)
+}
+
+#[inline(always)]
 pub fn random_level(level_norm_param: f32, max_level: usize) -> usize {
     let f = rand::random::<f32>();
     let level = (-f.ln() * level_norm_param).floor() as usize;
@@ -195,6 +265,7 @@ pub trait HNSWStyleBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<
 	fn _into_parts(self) -> (Vec<Self::Graph>, Vec<Vec<R>>, Vec<Vec<R>>, Dist);
 	fn _max_build_heap_size(&self) -> usize;
 	fn _max_build_frontier_size(&self) -> Option<usize>;
+	fn _max_degrees(&self) -> (usize, usize);
 	#[inline(always)]
 	fn _get_dist<M: MatrixDataSource<F>>(&self, mat: &M, i: usize, j: usize) -> F {
 		if M::SUPPORTS_ROW_VIEW {
@@ -215,6 +286,20 @@ pub trait HNSWStyleBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<
 		let builder = Self::base_init(&mat, dist, params);
 		let (graphs, local_layer_ids, global_layer_ids, dist) = builder._into_parts();
 		make_greedy_capped_index(graphs, local_layer_ids, global_layer_ids, mat, dist, higher_level_max_heap_size, max_frontier_size)
+	}
+	#[inline(always)]
+	fn build_fat<M: MatrixDataSource<F>+Sync>(mat: M, dist: Dist, params: Self::Params, higher_level_max_heap_size: usize) -> GreedyLayeredGraphIndex<R, F, Dist, M, FatDirGraph<R>> {
+		let builder = Self::base_init(&mat, dist, params);
+		let (lowest_max_degree, higher_max_degree) = builder._max_degrees();
+		let (graphs, _, global_layer_ids, dist) = builder._into_parts();
+		make_fat_greedy_index(graphs, global_layer_ids, mat, dist, higher_level_max_heap_size, higher_max_degree, lowest_max_degree)
+	}
+	#[inline(always)]
+	fn build_fat_capped<M: MatrixDataSource<F>+Sync>(mat: M, dist: Dist, params: Self::Params, higher_level_max_heap_size: usize, max_frontier_size: usize) -> GreedyCappedLayeredGraphIndex<R, F, Dist, M, FatDirGraph<R>> {
+		let builder = Self::base_init(&mat, dist, params);
+		let (lowest_max_degree, higher_max_degree) = builder._max_degrees();
+		let (graphs, _, global_layer_ids, dist) = builder._into_parts();
+		make_fat_greedy_capped_index(graphs, global_layer_ids, mat, dist, higher_level_max_heap_size, higher_max_degree, lowest_max_degree, max_frontier_size)
 	}
 	/// Searches in the specified layer.
 	/// 
@@ -550,6 +635,10 @@ pub mod single_threaded {
 		fn _into_parts(self) -> (Vec<HNSWBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
 			(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
 		}
+		#[inline(always)]
+		fn _max_degrees(&self) -> (usize, usize) {
+			(self.params.lowest_max_degree, self.params.higher_max_degree)
+		}
 		fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 			let n_data = mat.n_rows();
 			assert!(n_data < R::max_value().to_usize().unwrap());
@@ -572,7 +661,6 @@ pub mod single_threaded {
 			builder.train(mat);
 			builder
 		}
-
 	}
 
 
@@ -738,6 +826,10 @@ pub mod single_threaded {
 		#[inline(always)]
 		fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
 			(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
+		}
+		#[inline(always)]
+		fn _max_degrees(&self) -> (usize, usize) {
+			(self.params.lowest_max_degree, self.params.higher_max_degree)
 		}
 		fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 			let n_data = mat.n_rows();
@@ -958,6 +1050,10 @@ pub mod single_threaded {
 		#[inline(always)]
 		fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
 			(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
+		}
+		#[inline(always)]
+		fn _max_degrees(&self) -> (usize, usize) {
+			(self.params.lowest_max_degree, self.params.higher_max_degree)
 		}
 		fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 			let n_data = mat.n_rows();
@@ -1406,6 +1502,10 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 	fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
 		(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
 	}
+	#[inline(always)]
+	fn _max_degrees(&self) -> (usize, usize) {
+		(self.params.lowest_max_degree, self.params.higher_max_degree)
+	}
 	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
 		assert!(n_data < R::max_value().to_usize().unwrap());
@@ -1840,6 +1940,10 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 	fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
 		(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
 	}
+	#[inline(always)]
+	fn _max_degrees(&self) -> (usize, usize) {
+		(self.params.lowest_max_degree, self.params.higher_max_degree)
+	}
 	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
 		assert!(n_data < R::max_value().to_usize().unwrap());
@@ -2167,6 +2271,10 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 	#[inline(always)]
 	fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
 		(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
+	}
+	#[inline(always)]
+	fn _max_degrees(&self) -> (usize, usize) {
+		(self.params.lowest_max_degree, self.params.higher_max_degree)
 	}
 	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
@@ -2509,6 +2617,10 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 	fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
 		(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
 	}
+	#[inline(always)]
+	fn _max_degrees(&self) -> (usize, usize) {
+		(self.params.lowest_max_degree, self.params.higher_max_degree)
+	}
 	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
 		assert!(n_data < R::max_value().to_usize().unwrap());
@@ -2723,7 +2835,7 @@ mod tests {
 		let params = HNSWParams::new()
 		.with_insert_heuristic_extend(false);
 		let graph_time = std::time::Instant::now();
-		let _graph = HNSWBuilder::<u64,_,_>::build(data, EuclideanDistance::new(), params, 1);
+		let _graph = HNSWBuilder::<u64,_,_>::build_fat(data, EuclideanDistance::new(), params, 1);
 		println!("Graph construction: {:.2?}", graph_time.elapsed());
 	}
 	
