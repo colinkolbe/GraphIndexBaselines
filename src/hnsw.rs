@@ -183,7 +183,7 @@ fn make_fat_greedy_index<
 	Dist: Distance<F>,
 	G: Graph<R>,
 >(graphs: Vec<G>, global_layer_ids: Vec<Vec<R>>, mat: M, dist: Dist, higher_level_max_heap_size: usize, higher_level_max_degree: usize, lowest_level_max_degree: usize) -> GreedyLayeredGraphIndex<R, F, Dist, M, FatDirGraph<R>> {
-	let top_entry_points = Some(vec![global_layer_ids.last().unwrap()[0]]);
+	let top_entry_points = if global_layer_ids.len() > 0 { Some(vec![global_layer_ids.last().unwrap()[0]]) } else { Some(vec![R::zero()]) };
 	let mut fat_graphs = Vec::new();
 	fat_graphs.push(graphs[0].as_fat_dir_graph(
 		None,
@@ -217,7 +217,7 @@ fn make_fat_greedy_capped_index<
 	Dist: Distance<F>,
 	G: Graph<R>,
 >(graphs: Vec<G>, global_layer_ids: Vec<Vec<R>>, mat: M, dist: Dist, higher_level_max_heap_size: usize, higher_level_max_degree: usize, lowest_level_max_degree: usize, max_frontier_size: usize) -> GreedyCappedLayeredGraphIndex<R, F, Dist, M, FatDirGraph<R>> {
-	let top_entry_points = Some(vec![global_layer_ids.last().unwrap()[0]]);
+	let top_entry_points = if global_layer_ids.len() > 0 { Some(vec![global_layer_ids.last().unwrap()[0]]) } else { Some(vec![R::zero()]) };
 	let mut fat_graphs = Vec::new();
 	fat_graphs.push(graphs[0].as_fat_dir_graph(
 		None,
@@ -1533,11 +1533,27 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 }
 
 
+
+param_struct!(HNSWSENParams[Copy, Clone] {
+	higher_max_degree: usize = 50,
+	lowest_max_degree: usize = 100,
+	max_layers: usize = 10,
+	n_parallel_burnin: usize = 0,
+	max_build_heap_size: usize = 50,
+	max_build_frontier_size: Option<usize> = Some(100),
+	level_norm_param_override: Option<f32> = None,
+	insert_heuristic: bool = true,
+	insert_heuristic_extend: bool = true,
+	post_prune_heuristic: bool = false,
+	insert_minibatch_size: usize = 100,
+	n_rounds: usize = 1,
+	max_cos: f64 = 0.5,
+});
 pub struct HNSWParallelSENHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
 	_phantom: std::marker::PhantomData<F>,
 	n_data: usize,
 	n_threads: usize,
-	params: HNSWParams,
+	params: HNSWSENParams,
 	node_locks: Vec<Mutex<()>>,
 	n_layers: usize,
 	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
@@ -1687,7 +1703,9 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				}
 			});
 		});
-		self.prune_non_sen_edges(mat);
+		if self.params.post_prune_heuristic {
+			self.prune_non_sen_edges(mat);
+		}
 	}
 	fn insert<M: MatrixDataSource<F>+Sync>(&mut self, i_round: usize, mat: &M, mut i: usize, i_global: usize, level: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
 		/* We just assume that the global index 1 is the root entry point */
@@ -1715,7 +1733,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		/* Choose the appropriate max degree */
 		let max_neighbors = if layer == 0 { self.params.lowest_max_degree } else { self.params.higher_max_degree };
 		/* TODO: Additional parameters should eventually be moved to a new parameter type */
-		let max_cos = 0.4265405803162139;
+		let max_cos = F::from(self.params.max_cos).unwrap();
 		let min_neighbors = max_neighbors;
 		// let min_neighbors = 20;
 		// let min_neighbors = 0;
@@ -1794,7 +1812,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 								let djk = self._get_dist(mat, j_global.to_usize().unwrap_unchecked(), k_global.to_usize().unwrap_unchecked());
 								// dik < djk
 								/* Only insert if angle to all neighbors is larger than threshold (cos is smaller than threshold) */
-								tri_to_cos(dij.to_f32().unwrap_unchecked(),dik.to_f32().unwrap_unchecked(),djk.to_f32().unwrap_unchecked(),true) < max_cos
+								tri_to_cos::<F>(dij,dik,djk,true) < max_cos
 							}) {
 								i_adj.push(dij,j);
 							} else {
@@ -1823,7 +1841,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 							if j_adj.size() < min_neighbors || j_adj.iter().all(|&(djk,k)| djk < dij || {
 								let k_global = (if layer>0 { self.global_layer_ids[layer-1][k.to_usize().unwrap_unchecked()] } else { k }).to_usize().unwrap_unchecked();
 								let dik = self._get_dist(mat, i_global, k_global);
-								tri_to_cos(dij.to_f32().unwrap_unchecked(),djk.to_f32().unwrap_unchecked(),dik.to_f32().unwrap_unchecked(),true) < max_cos
+								tri_to_cos(dij,djk,dik,true) < max_cos
 							}) {
 								j_adj.push(dij,i);
 							}
@@ -1846,7 +1864,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 									let dik = self._get_dist(mat, i_global, k_global);
 									/* If heuristic criterion applies, remove neighbor */
 									/* I.e. only keep neighbors with an angle larger than threshold (cos smaller than threshold) */
-									if tri_to_cos(dij.to_f32().unwrap_unchecked(),djk.to_f32().unwrap_unchecked(),dik.to_f32().unwrap_unchecked(),true) < max_cos {
+									if tri_to_cos(dij,djk,dik,true) < max_cos {
 										tmp_list.push((djk,k));
 									} else {
 										tmp_rem_list.push((djk,k));
@@ -1867,7 +1885,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 	#[allow(unused)]
 	fn prune_non_sen_edges<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
-		let (n_data, max_cos, dist_is_sq) = (self.n_data, F::from(0.55).unwrap(), true);
+		let (n_data, max_cos, dist_is_sq) = (self.n_data, F::from(self.params.max_cos).unwrap(), true);
 		let n_threads = self.n_threads;
 		let dist_fun = |a,b| self._get_dist(mat,a,b);
 		let unsafe_self_ref = std::ptr::from_ref(self) as *mut Self;
@@ -1922,7 +1940,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWParallelSENHeapBuilder<R, F, Dist> {
-	type Params = HNSWParams;
+	type Params = HNSWSENParams;
 	type Graph = HNSWHeapBuildGraph<R,F>;
 	#[inline(always)]
 	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -2650,7 +2668,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 
 
 
-pub fn load_hnswlib_parts<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> (Array2<F>, Vec<DirLoLGraph<R>>, Vec<Vec<R>>, Vec<Vec<R>>, R) {
+pub fn load_hnswlib_fat_parts<F: SyncFloat>(file: &str) -> (Array2<F>, usize, usize, usize, usize, Vec<Vec<Vec<usize>>>, Vec<usize>, usize) {
 	use std::fs::File;
 	use std::io::BufReader;
 	use std::io::Read;
@@ -2706,8 +2724,10 @@ pub fn load_hnswlib_parts<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> (
 		let n_neighbors_0 = get_type_at::<u32>(&file_data, level_0_start + i_obj*size_per_elem as usize) as usize;
 		assert!(n_neighbors_0 <= max_m0 as usize, "Too many neighbors in level 0: {:?}", n_neighbors_0);
 		let adj_0 = get_vec::<u32>(&file_data, level_0_start + i_obj*size_per_elem as usize + 4, n_neighbors_0);
-		adj_0.into_iter().for_each(|x| adjs[0][i_obj].push(x as usize));
-		let n_bytes_higher_adjs = get_type_at::<u32>(&file_data, higher_offset) as usize;
+		adjs[0][ids[i_obj]].reserve(n_neighbors_0);
+		adj_0.into_iter().for_each(|x| adjs[0][ids[i_obj]].push(ids[x as usize]));
+		assert!(adjs[0][ids[i_obj]].len() == n_neighbors_0, "Adjacency list length mismatch at layer 0: {:?} != {:?}", adjs[0][ids[i_obj]].len(), n_neighbors_0);
+		let n_bytes_higher_adjs: usize = get_type_at::<u32>(&file_data, higher_offset) as usize;
 		assert!(n_bytes_higher_adjs % higher_adj_size == 0, "Invalid higher adjacency list size: {:?}", n_bytes_higher_adjs);
 		higher_offset += 4;
 		let level = n_bytes_higher_adjs / higher_adj_size;
@@ -2717,16 +2737,22 @@ pub fn load_hnswlib_parts<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> (
 			let n_neighbors_i = get_type_at::<u32>(&file_data, list_pos) as usize;
 			assert!(n_neighbors_i <= max_m as usize, "Too many neighbors in level {:?}: {:?}", i_level+1, n_neighbors_i);
 			let adj_i = get_vec::<u32>(&file_data, list_pos + 4, n_neighbors_i);
+			adjs[i_level+1][ids[i_obj]].reserve(n_neighbors_i);
 			adj_i.into_iter().for_each(|x| adjs[i_level+1][ids[i_obj]].push(ids[x as usize]));
+			assert!(adjs[i_level+1][ids[i_obj]].len() == n_neighbors_i, "Adjacency list length mismatch at layer {:?}: {:?} != {:?}", i_level+1, adjs[i_level+1][ids[i_obj]].len(), n_neighbors_i);
 		});
 		higher_offset += n_bytes_higher_adjs;
 	});
+	(data, max_m as usize, max_m0 as usize, max_level, curr_elements as usize, adjs, node_levels, entry_point)
+}
+pub fn load_hnswlib_parts<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> (Array2<F>, Vec<DirLoLGraph<R>>, Vec<Vec<R>>, Vec<Vec<R>>, R) {
+	let (data, _, _, max_level, curr_elements, adjs, node_levels, entry_point) = load_hnswlib_fat_parts(file);
 	/* Translate adjacency lists into graphs and ID maps */
 	let mut graphs: Vec<DirLoLGraph<R>> = (0..max_level+1).map(|_| DirLoLGraph::new()).collect();
 	let mut local_id_maps = vec![Vec::new(); max_level];
 	let mut global_id_maps = vec![Vec::new(); max_level];
 	adjs.iter().enumerate().for_each(|(i_level, adj)| {
-		let mut adj_id_map = Vec::with_capacity(curr_elements as usize);
+		let mut adj_id_map = Vec::with_capacity(curr_elements);
 		let mut found_nodes = 0;
 		adj.iter().enumerate().for_each(|(i_node, i_adj)| {
 			if node_levels[i_node] >= i_level {
@@ -2766,6 +2792,33 @@ pub fn load_hnswlib_parts<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> (
 	/* Return the loaded values */
 	(data, graphs, local_id_maps, global_id_maps, entry_point)
 }
+pub fn load_hnswlib_fat<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> GreedyLayeredGraphIndex<R, F, SquaredEuclideanDistance<F>, Array2<F>, FatDirGraph<R>>{
+	let (data, max_m, max_m0, _, curr_elements, adjs, _, entry_point) = load_hnswlib_fat_parts(file);
+	/* Translate adjacency lists into graphs */
+	let graphs = adjs.into_iter().enumerate().map(|(i_graph, adj)| {
+		let mut graph = FatDirGraph::new(if i_graph==0 {max_m0} else {max_m});
+		graph.reserve(curr_elements);
+		(0..curr_elements).for_each(|_| graph.add_node());
+		adj.into_iter().enumerate().for_each(|(i_node, neighbors)| {
+			neighbors.into_iter().for_each(|j_node| {
+				graph.add_edge(R::from_usize(i_node).unwrap(), R::from_usize(j_node).unwrap());
+			})
+		});
+		graph
+	}).collect();
+	GreedyLayeredGraphIndex::new(
+		data,
+		graphs,
+		Vec::new(),
+		Vec::new(),
+		SquaredEuclideanDistance::new(),
+		1,
+		Some(vec![R::from(entry_point).unwrap()])
+	)
+}
+pub fn load_hnswlib_fat_capped<R: SyncUnsignedInteger, F: SyncFloat>(file: &str, max_frontier_size: usize) -> GreedyCappedLayeredGraphIndex<R, F, SquaredEuclideanDistance<F>, Array2<F>, FatDirGraph<R>>{
+	load_hnswlib_fat(file).into_capped(max_frontier_size)
+}
 pub fn load_hnswlib<R: SyncUnsignedInteger, F: SyncFloat>(file: &str) -> GreedyLayeredGraphIndex<R, F, SquaredEuclideanDistance<F>, Array2<F>, DirLoLGraph<R>>{
 	let (data, graphs, local_id_maps, global_id_maps, entry_point) = load_hnswlib_parts(file);
 	GreedyLayeredGraphIndex::new(
@@ -2789,7 +2842,7 @@ pub fn load_hnswlib_capped<R: SyncUnsignedInteger, F: SyncFloat>(file: &str, max
 		1,
 		max_frontier_size,
 		Some(vec![entry_point]),
-)
+	)
 }
 
 
@@ -2881,8 +2934,8 @@ mod tests {
 		// .with_max_layers(1)
 		.with_n_rounds(3)
 		;
-		// type BuilderType = HNSWParallelHeapBuilder<R,F,Dist>;
-		type BuilderType = HNSWParallelSENHeapBuilder<R,F,Dist>;
+		type BuilderType = HNSWParallelHeapBuilder<R,F,Dist>;
+		// type BuilderType = HNSWParallelSENHeapBuilder<R,F,Dist>;
 		// type BuilderType = HNSWParallelHeapBuilder2<R,F,Dist>;
 		// type BuilderType = HNSWParallelPresortedHeapBuilder<R,F,Dist>;
 		let index1 = BuilderType::build(data.view(), dist, params, 1);

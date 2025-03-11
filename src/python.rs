@@ -7,7 +7,7 @@ use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use graphidx::{graphs::{DirLoLGraph, FatDirGraph, Graph}, indices::{GraphIndex, GreedyCappedLayeredGraphIndex, GreedyCappedSingleGraphIndex, GreedyLayeredGraphIndex, GreedySingleGraphIndex}, measures::SquaredEuclideanDistance, types::UnsignedInteger};
 use pyo3::prelude::*;
 
-use crate::{hnsw::{HNSWParallelHeapBuilder, HNSWParams, HNSWStyleBuilder}, rnn::RNNStyleBuilder};
+use crate::{hnsw::{HNSWParallelHeapBuilder, HNSWParallelSENHeapBuilder, HNSWParams, HNSWSENParams, HNSWStyleBuilder}, rnn::RNNStyleBuilder};
 
 /* Conversion code to handle different ndarray versions in this crate and numpy dependencies */
 fn arr1_rust_to_py<T>(arr: Array1<T>) -> numpy::ndarray::Array1<T> {
@@ -445,6 +445,122 @@ impl OwningPyHNSW {
 }
 generic_graph_index_funs!(layered OwningPyHNSW);
 #[pyclass]
+pub struct OwningPyFatHNSW {
+	index: IndexOneOf<FGLIndex<Array2<f32>>, FGCLIndex<Array2<f32>>>,
+	max_frontier_size: Option<usize>,
+}
+#[pymethods]
+impl OwningPyFatHNSW {
+	#[new]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None))]
+	fn new<'py>(
+		data: Bound<'py, PyArray2<f32>>,
+		higher_max_degree: Option<usize>,
+		lowest_max_degree: Option<usize>,
+		max_layers: Option<usize>,
+		n_parallel_burnin: Option<usize>,
+		max_build_heap_size: Option<usize>,
+		max_build_frontier_size: Option<usize>,
+		level_norm_param_override: Option<f32>,
+		insert_heuristic: Option<bool>,
+		insert_heuristic_extend: Option<bool>,
+		post_prune_heuristic: Option<bool>,
+		insert_minibatch_size: Option<usize>,
+		n_rounds: Option<usize>,
+		max_frontier_size: Option<usize>,
+	) -> Self {
+		let hnsw_params = HNSWParams::new()
+		.maybe_with_higher_max_degree(higher_max_degree)
+		.maybe_with_lowest_max_degree(lowest_max_degree)
+		.maybe_with_max_layers(max_layers)
+		.maybe_with_n_parallel_burnin(n_parallel_burnin)
+		.maybe_with_max_build_heap_size(max_build_heap_size)
+		.with_max_build_frontier_size(max_build_frontier_size)
+		.with_level_norm_param_override(level_norm_param_override)
+		.maybe_with_insert_heuristic(insert_heuristic)
+		.maybe_with_insert_heuristic_extend(insert_heuristic_extend)
+		.maybe_with_post_prune_heuristic(post_prune_heuristic)
+		.maybe_with_insert_minibatch_size(insert_minibatch_size)
+		.maybe_with_n_rounds(n_rounds)
+		;
+		unsafe {
+			let index = HNSWParallelHeapBuilder::build_fat(
+				arrview2_py_to_rust(data.as_array()).into_owned(),
+				SquaredEuclideanDistance::new(),
+				hnsw_params,
+				1,
+			);
+			if max_frontier_size.is_some() {
+				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
+				OwningPyFatHNSW { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size }
+			} else {
+				OwningPyFatHNSW { index: IndexOneOf::A(index), max_frontier_size: None }
+			}
+		}
+	}
+}
+generic_graph_index_funs!(layered OwningPyFatHNSW);
+
+#[pyclass]
+pub struct PySENHNSW {
+	index: IndexOneOf<GLIndex<ArrayView2<'static,f32>>, GCLIndex<ArrayView2<'static,f32>>>,
+	max_frontier_size: Option<usize>,
+}
+#[pymethods]
+impl PySENHNSW {
+	#[new]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None, max_cos=None))]
+	fn new<'py>(
+		data: Bound<'py, PyArray2<f32>>,
+		higher_max_degree: Option<usize>,
+		lowest_max_degree: Option<usize>,
+		max_layers: Option<usize>,
+		n_parallel_burnin: Option<usize>,
+		max_build_heap_size: Option<usize>,
+		max_build_frontier_size: Option<usize>,
+		level_norm_param_override: Option<f32>,
+		insert_heuristic: Option<bool>,
+		insert_heuristic_extend: Option<bool>,
+		post_prune_heuristic: Option<bool>,
+		insert_minibatch_size: Option<usize>,
+		n_rounds: Option<usize>,
+		max_frontier_size: Option<usize>,
+		max_cos: Option<f64>,
+	) -> Self {
+		let hnsw_params = HNSWSENParams::new()
+		.maybe_with_higher_max_degree(higher_max_degree)
+		.maybe_with_lowest_max_degree(lowest_max_degree)
+		.maybe_with_max_layers(max_layers)
+		.maybe_with_n_parallel_burnin(n_parallel_burnin)
+		.maybe_with_max_build_heap_size(max_build_heap_size)
+		.with_max_build_frontier_size(max_build_frontier_size)
+		.with_level_norm_param_override(level_norm_param_override)
+		.maybe_with_insert_heuristic(insert_heuristic)
+		.maybe_with_insert_heuristic_extend(insert_heuristic_extend)
+		.maybe_with_post_prune_heuristic(post_prune_heuristic)
+		.maybe_with_insert_minibatch_size(insert_minibatch_size)
+		.maybe_with_n_rounds(n_rounds)
+		.maybe_with_max_cos(max_cos)
+		;
+		unsafe {
+			let index = HNSWParallelSENHeapBuilder::build(
+				arrview2_py_to_rust(data.as_array()),
+				SquaredEuclideanDistance::new(),
+				hnsw_params,
+				1,
+			);
+			if max_frontier_size.is_some() {
+				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
+				PySENHNSW { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size }
+			} else {
+				PySENHNSW { index: IndexOneOf::A(index), max_frontier_size: None }
+			}
+		}
+	}
+}
+generic_graph_index_funs!(layered PySENHNSW);
+
+#[pyclass]
 pub struct PyRNNDescent {
 	index: IndexOneOf<GSIndex<ArrayView2<'static,f32>>, GCSIndex<ArrayView2<'static,f32>>>,
 	max_frontier_size: Option<usize>,
@@ -546,6 +662,16 @@ pub fn load_hnswlib(file: &str, max_frontier_size: Option<usize>) -> OwningPyHNS
 		OwningPyHNSW{index:IndexOneOf::B(index.into_capped(max_frontier_size.unwrap())), max_frontier_size:max_frontier_size}
 	}
 }
+#[pyfunction]
+#[pyo3(signature = (file, max_frontier_size=None))]
+pub fn load_hnswlib_fat(file: &str, max_frontier_size: Option<usize>) -> OwningPyFatHNSW {
+	let index = crate::hnsw::load_hnswlib_fat(file);
+	if max_frontier_size.is_none() {
+		OwningPyFatHNSW{index:IndexOneOf::A(index), max_frontier_size:None}
+	} else {
+		OwningPyFatHNSW{index:IndexOneOf::B(index.into_capped(max_frontier_size.unwrap())), max_frontier_size:max_frontier_size}
+	}
+}
 
 
 
@@ -554,9 +680,12 @@ fn hnsw(m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add_class::<PyHNSW>()?;
 	m.add_class::<PyFatHNSW>()?;
 	m.add_class::<OwningPyHNSW>()?;
+	m.add_class::<OwningPyFatHNSW>()?;
+	m.add_class::<PySENHNSW>()?;
 	m.add_class::<PyRNNDescent>()?;
 	m.add_class::<PySENDescent>()?;
 	m.add_function(wrap_pyfunction!(load_hnswlib, m)?)?;
+	m.add_function(wrap_pyfunction!(load_hnswlib_fat, m)?)?;
 	Ok(())
 }
 
