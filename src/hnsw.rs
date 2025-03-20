@@ -2,8 +2,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Mutex;
 
-use foldhash::HashSet;
-
 use graphidx::graphs::*;
 use graphidx::heaps::*;
 use graphidx::random::RandomPermutationGenerator;
@@ -11,6 +9,7 @@ use graphidx::types::*;
 use graphidx::indices::*;
 use graphidx::measures::*;
 use graphidx::data::*;
+use graphidx::sets::HashSetLike;
 use rayon::current_num_threads;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
@@ -19,6 +18,81 @@ use rayon::slice::ParallelSliceMut;
 use ndarray::Array2;
 
 use crate::util::remove_duplicates_with_key;
+
+// type HashSet<T> = foldhash::HashSet<T>;
+// type HashSet<T> = graphidx::sets::ArraySet<T,u8>;
+type HashSet<T> = graphidx::sets::BitSet<T>;
+// type HashSet<T> = graphidx::sets::ApproxBitSet<T>;
+// type HashSet<T> = graphidx::sets::TrackingBitSet<T>;
+// type HashSet<T> = graphidx::sets::SwappingArraySet<T,u8>;
+// type HashSet<T> = graphidx::sets::NAryArraySet<T,u8>;
+
+/* Wrapping the used sets in an enum allows to create a vec
+ * over an arbitrary combination of those */
+ /* TODO: Add this to the HNSW impl */
+enum HashOrBitset<T: SyncUnsignedInteger+std::hash::Hash> {
+	Hash(foldhash::HashSet<T>),
+	Bit(graphidx::sets::BitSet<T>),
+}
+impl<T: SyncUnsignedInteger+std::hash::Hash> HashOrBitset<T> {
+	#[inline(always)]
+	fn new_bit(capacity: usize) -> Self {
+		HashOrBitset::Bit(<graphidx::sets::BitSet<T> as HashSetLike<T>>::new(capacity))
+	}
+	#[inline(always)]
+	fn new_hash(capacity: usize) -> Self {
+		HashOrBitset::Hash(<foldhash::HashSet<T> as HashSetLike<T>>::new(capacity))
+	}
+}
+impl<T: SyncUnsignedInteger+std::hash::Hash> HashSetLike<T> for HashOrBitset<T> {
+	#[inline(always)]
+	fn new(capacity: usize) -> Self {
+		/* 5M is approximately the empirically dervied threshold
+		 * when hashsets become faster in a HNSW-typical setting */
+		if capacity <= 5_000_000 {
+			HashOrBitset::new_bit(capacity)
+		} else {
+			HashOrBitset::new_hash(capacity)
+		}
+	}
+	#[inline(always)]
+	fn reserve(&mut self, additional: usize) {
+		match self {
+			HashOrBitset::Hash(h) => h.reserve(additional),
+			HashOrBitset::Bit(b) => b.reserve(additional),
+		}
+	}
+	#[inline(always)]
+	fn insert(&mut self, value: T) -> bool {
+		match self {
+			HashOrBitset::Hash(h) => h.insert(value),
+			HashOrBitset::Bit(b) => b.insert(value),
+		}
+	}
+	#[inline(always)]
+	fn contains(&self, value: &T) -> bool {
+		match self {
+			HashOrBitset::Hash(h) => h.contains(value),
+			HashOrBitset::Bit(b) => b.contains(value),
+		}
+	}
+	#[inline(always)]
+	fn clear(&mut self) {
+		match self {
+			HashOrBitset::Hash(h) => h.clear(),
+			HashOrBitset::Bit(b) => b.clear(),
+		}
+	}
+}
+#[test]
+fn test_hash_or_bitset() {
+	let mut vec: Vec<HashOrBitset<usize>> = Vec::new();
+	vec.push(HashOrBitset::new_bit(10));
+	vec.push(HashOrBitset::new_bit(1_000));
+	vec.push(HashOrBitset::new_bit(100_000));
+	vec.push(HashOrBitset::new_hash(10_000_000));
+	std::hint::black_box(&vec);
+}
 
 
 type HNSWBuildGraph<R,F> = WDirLoLGraph<R,F>;
@@ -502,9 +576,9 @@ pub mod single_threaded {
 				}
 			});
 			/* Insert all other points as you would */
-			let mut search_hashset = HashSet::default();
+			let mut search_hashset = <HashSet<R> as HashSetLike<R>>::new(self.n_data);
 			search_hashset.reserve(self.params.max_build_heap_size*2);
-			let mut heuristic_hashset = HashSet::default();
+			let mut heuristic_hashset = <HashSet<R> as HashSetLike<R>>::new(self.n_data);
 			heuristic_hashset.reserve(self.params.lowest_max_degree*self.params.lowest_max_degree);
 			let mut search_maxheap = MaxHeap::with_capacity(self.params.max_build_heap_size);
 			let mut frontier_minheap = MinHeap::with_capacity(if self.params.max_build_frontier_size.is_some() {0} else {self.params.max_build_heap_size});
@@ -704,9 +778,9 @@ pub mod single_threaded {
 				}
 			});
 			/* Insert all other points as you would */
-			let mut search_hashset = HashSet::default();
+			let mut search_hashset = <HashSet<R> as HashSetLike<R>>::new(self.n_data);
 			search_hashset.reserve(self.params.max_build_heap_size*2);
-			let mut heuristic_hashset = HashSet::default();
+			let mut heuristic_hashset = <HashSet<R> as HashSetLike<R>>::new(self.n_data);
 			heuristic_hashset.reserve(self.params.lowest_max_degree*self.params.lowest_max_degree);
 			let mut search_maxheap = MaxHeap::with_capacity(self.params.max_build_heap_size);
 			let mut frontier_minheap = MinHeap::with_capacity(if self.params.max_build_frontier_size.is_some() {0} else {self.params.max_build_heap_size});
@@ -934,9 +1008,9 @@ pub mod single_threaded {
 				}
 			}
 			/* Insert all other points as you would */
-			let mut search_hashset = HashSet::default();
+			let mut search_hashset = <HashSet<R> as HashSetLike<R>>::new(self.n_data);
 			search_hashset.reserve(self.params.max_build_heap_size*2);
-			let mut heuristic_hashset = HashSet::default();
+			let mut heuristic_hashset = <HashSet<R> as HashSetLike<R>>::new(self.n_data);
 			heuristic_hashset.reserve(self.params.lowest_max_degree*self.params.lowest_max_degree);
 			let mut search_maxheap = MaxHeap::with_capacity(self.params.max_build_heap_size);
 			let mut frontier_minheap = MinHeap::with_capacity(if self.params.max_build_frontier_size.is_some() {0} else {self.params.max_build_heap_size});
@@ -1113,11 +1187,11 @@ struct HNSWThreadCache<R: SyncUnsignedInteger, F: SyncFloat> {
 	frontier_dualheap: DualHeap<F,R>,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat> HNSWThreadCache<R,F> {
-	fn new(max_build_heap_size: usize, lowest_max_degree: usize, max_build_frontier_size: Option<usize>) -> Self {
+	fn new(n_data: usize, max_build_heap_size: usize, lowest_max_degree: usize, max_build_frontier_size: Option<usize>) -> Self {
 		let entry_points = Vec::with_capacity(max_build_heap_size);
-		let mut search_hashset = HashSet::default();
+		let mut search_hashset = <HashSet<R> as HashSetLike<R>>::new(n_data);
 		search_hashset.reserve(max_build_heap_size*2);
-		let mut heuristic_hashset = HashSet::default();
+		let mut heuristic_hashset = <HashSet<R> as HashSetLike<R>>::new(n_data);
 		heuristic_hashset.reserve(lowest_max_degree*lowest_max_degree);
 		let search_maxheap = MaxHeap::with_capacity(max_build_heap_size);
 		let frontier_minheap = MinHeap::with_capacity(if max_build_frontier_size.is_some() {0} else {max_build_heap_size});
@@ -1252,12 +1326,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		let (point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
 		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(1..n_burnin+1).for_each(|i| {
 			self.insert(0, mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
 		});
 		/* Insert edges to the graphs as per HNSW insertion rules */
-		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
+		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
 		let chunk_size = (self.n_data-n_burnin + self.n_threads - 1) / self.n_threads;
 		(1+n_burnin..self.n_data).step_by(chunk_size)
 		.map(|start| start..(start+chunk_size).min(self.n_data))
@@ -1324,7 +1398,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 	fn insert_layer<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, i: usize, i_global: usize, layer: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
 		let neighbors = &mut thread_cache.entry_points;
-		assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<HashSet<_>>().len());
+		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
 		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
@@ -1669,12 +1743,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		let (point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
 		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(1..n_burnin+1).for_each(|i| {
 			self.insert(0, mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
 		});
 		/* Insert edges to the graphs as per HNSW insertion rules */
-		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
+		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
 		let chunk_size = (self.n_data-n_burnin + self.n_threads - 1) / self.n_threads;
 		(1+n_burnin..self.n_data).step_by(chunk_size)
 		.map(|start| start..(start+chunk_size).min(self.n_data))
@@ -1741,7 +1815,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		// let protected_neighbors = 20;
 		let protected_neighbors = 0;
 		let neighbors = &mut thread_cache.entry_points;
-		assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<HashSet<_>>().len());
+		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
 		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
@@ -2113,7 +2187,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		println!("{:?}", order[0..50].iter().map(|&i| (i,point_levels[i])).collect::<Vec<_>>());
 		/* Burnin single thread for a few samples */
 		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(0..n_burnin).for_each(|i| {
 			let i = order[i];
 			self.insert(mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
@@ -2123,7 +2197,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		(n_burnin..self.n_data-1).step_by(chunk_size)
 		.map(|start| start..(start+chunk_size).min(self.n_data-1))
 		.par_bridge().for_each(|chunk| {
-			let mut thread_cache = HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+			let mut thread_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 			let unsafe_self_ref = std::ptr::addr_of!(*self) as *mut Self;
 			#[cfg(debug_assertions)]
 			unsafe { /* Ensure that the self ref actually works */
@@ -2166,7 +2240,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 	fn insert_layer<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, i: usize, i_global: usize, layer: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
 		let neighbors = &mut thread_cache.entry_points;
-		assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<HashSet<_>>().len());
+		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
 		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
@@ -2441,7 +2515,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		let (point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
 		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		let mut rev_edges = Vec::new();
 		(1..n_burnin+1).for_each(|i| {
 			rev_edges.clear();
@@ -2464,7 +2538,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		});
 		/* Insert edges to the graphs as per HNSW insertion rules */
 		let chunk_size = self.n_threads * self.params.insert_minibatch_size;
-		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
+		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
 		let insert_minibatch_size = self.params.insert_minibatch_size;
 		let n_data = self.n_data;
 		(1+n_burnin..self.n_data).step_by(chunk_size)
@@ -2509,7 +2583,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 	fn insert_layer<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, i: usize, i_global: usize, layer: usize, thread_cache: &mut HNSWThreadCache<R,F>, rev_edges: &mut Vec<(usize,R,R,F)>) {
 		let neighbors = &mut thread_cache.entry_points;
-		assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<HashSet<_>>().len());
+		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
 		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
@@ -2947,7 +3021,7 @@ mod tests {
 			(0..graph.n_vertices()).for_each(|i| {
 				let neighbors = graph.view_neighbors(i);
 				assert!(neighbors.len() <= if i_layer==0 {params.lowest_max_degree} else {params.higher_max_degree}, "Too many neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors.len());
-				assert_eq!(neighbors.iter().collect::<HashSet<_>>().len(), neighbors.len(), "Duplicate neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
+				assert_eq!(neighbors.iter().collect::<std::collections::HashSet<_>>().len(), neighbors.len(), "Duplicate neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
 				assert!(neighbors.iter().all(|&j| j!=i), "Loop in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
 				assert!(neighbors.iter().all(|&j| j < graph.n_vertices()), "Escaping edge in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
 			});
@@ -3050,7 +3124,7 @@ mod tests {
 				(0..graph.n_vertices()).for_each(|i| {
 					let neighbors = graph.view_neighbors(i);
 					assert!(neighbors.len() <= if i_layer==0 {params.lowest_max_degree} else {params.higher_max_degree}, "Too many neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors.len());
-					assert_eq!(neighbors.iter().collect::<HashSet<_>>().len(), neighbors.len(), "Duplicate neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
+					assert_eq!(neighbors.iter().collect::<std::collections::HashSet<_>>().len(), neighbors.len(), "Duplicate neighbors in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
 					assert!(neighbors.iter().all(|&j| j!=i), "Loop in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
 					assert!(neighbors.iter().all(|&j| j < graph.n_vertices()), "Escaping edge in graph {:?} at vertex {:?}: {:?}", i_layer, i, neighbors);
 				});
