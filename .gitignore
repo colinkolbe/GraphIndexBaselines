@@ -3,6 +3,7 @@ Cargo.lock
 target
 lib
 pyenv
+data
 
 *.sh
 flamegraph.svg
@@ -13,3 +14,4 @@ perf.data.old
 *_dump
 # Any top level python scripts
 /*.py
+__pycache__

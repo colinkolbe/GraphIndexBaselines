@@ -284,7 +284,7 @@ pub struct PyHNSW {
 #[pymethods]
 impl PyHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None, higher_level_max_heap_size=None))]
 	fn new<'py>(
 		data: Bound<'py, PyArray2<f32>>,
 		higher_max_degree: Option<usize>,
@@ -300,6 +300,7 @@ impl PyHNSW {
 		insert_minibatch_size: Option<usize>,
 		n_rounds: Option<usize>,
 		max_frontier_size: Option<usize>,
+		higher_level_max_heap_size: Option<usize>,
 	) -> Self {
 		let hnsw_params = HNSWParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -320,7 +321,7 @@ impl PyHNSW {
 				arrview2_py_to_rust(data.as_array()),
 				SquaredEuclideanDistance::new(),
 				hnsw_params,
-				1,
+				higher_level_max_heap_size.unwrap_or(1),
 			);
 			if max_frontier_size.is_some() {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
@@ -340,7 +341,7 @@ pub struct PyFatHNSW {
 #[pymethods]
 impl PyFatHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None, higher_level_max_heap_size=None))]
 	fn new<'py>(
 		data: Bound<'py, PyArray2<f32>>,
 		higher_max_degree: Option<usize>,
@@ -356,6 +357,7 @@ impl PyFatHNSW {
 		insert_minibatch_size: Option<usize>,
 		n_rounds: Option<usize>,
 		max_frontier_size: Option<usize>,
+		higher_level_max_heap_size: Option<usize>,
 	) -> Self {
 		let hnsw_params = HNSWParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -376,7 +378,7 @@ impl PyFatHNSW {
 				arrview2_py_to_rust(data.as_array()),
 				SquaredEuclideanDistance::new(),
 				hnsw_params,
-				1,
+				higher_level_max_heap_size.unwrap_or(1),
 			);
 			if max_frontier_size.is_some() {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
@@ -396,7 +398,7 @@ pub struct OwningPyHNSW {
 #[pymethods]
 impl OwningPyHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None, higher_level_max_heap_size=None))]
 	fn new<'py>(
 		data: Bound<'py, PyArray2<f32>>,
 		higher_max_degree: Option<usize>,
@@ -412,6 +414,7 @@ impl OwningPyHNSW {
 		insert_minibatch_size: Option<usize>,
 		n_rounds: Option<usize>,
 		max_frontier_size: Option<usize>,
+		higher_level_max_heap_size: Option<usize>,
 	) -> Self {
 		let hnsw_params = HNSWParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -432,7 +435,7 @@ impl OwningPyHNSW {
 				arrview2_py_to_rust(data.as_array()).into_owned(),
 				SquaredEuclideanDistance::new(),
 				hnsw_params,
-				1,
+				higher_level_max_heap_size.unwrap_or(1),
 			);
 			if max_frontier_size.is_some() {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
@@ -509,7 +512,7 @@ pub struct PySENHNSW {
 #[pymethods]
 impl PySENHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None, max_cos=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, max_frontier_size=None, max_cos=None, higher_level_max_heap_size=None))]
 	fn new<'py>(
 		data: Bound<'py, PyArray2<f32>>,
 		higher_max_degree: Option<usize>,
@@ -526,6 +529,7 @@ impl PySENHNSW {
 		n_rounds: Option<usize>,
 		max_frontier_size: Option<usize>,
 		max_cos: Option<f64>,
+		higher_level_max_heap_size: Option<usize>,
 	) -> Self {
 		let hnsw_params = HNSWSENParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -547,7 +551,7 @@ impl PySENHNSW {
 				arrview2_py_to_rust(data.as_array()),
 				SquaredEuclideanDistance::new(),
 				hnsw_params,
-				1,
+				higher_level_max_heap_size.unwrap_or(1),
 			);
 			if max_frontier_size.is_some() {
 				let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());

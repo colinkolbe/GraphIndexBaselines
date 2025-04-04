@@ -9,7 +9,7 @@ use graphidx::types::*;
 use graphidx::indices::*;
 use graphidx::measures::*;
 use graphidx::data::*;
-use graphidx::sets::HashSetLike;
+use graphidx::sets::{HashSetLike,HashOrBitset};
 use rayon::current_num_threads;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
@@ -27,72 +27,6 @@ type HashSet<T> = graphidx::sets::BitSet<T>;
 // type HashSet<T> = graphidx::sets::SwappingArraySet<T,u8>;
 // type HashSet<T> = graphidx::sets::NAryArraySet<T,u8>;
 
-/* Wrapping the used sets in an enum allows to create a vec
- * over an arbitrary combination of those */
- /* TODO: Add this to the HNSW impl */
-enum HashOrBitset<T: SyncUnsignedInteger+std::hash::Hash> {
-	Hash(foldhash::HashSet<T>),
-	Bit(graphidx::sets::BitSet<T>),
-}
-impl<T: SyncUnsignedInteger+std::hash::Hash> HashOrBitset<T> {
-	#[inline(always)]
-	fn new_bit(capacity: usize) -> Self {
-		HashOrBitset::Bit(<graphidx::sets::BitSet<T> as HashSetLike<T>>::new(capacity))
-	}
-	#[inline(always)]
-	fn new_hash(capacity: usize) -> Self {
-		HashOrBitset::Hash(<foldhash::HashSet<T> as HashSetLike<T>>::new(capacity))
-	}
-}
-impl<T: SyncUnsignedInteger+std::hash::Hash> HashSetLike<T> for HashOrBitset<T> {
-	#[inline(always)]
-	fn new(capacity: usize) -> Self {
-		/* 5M is approximately the empirically dervied threshold
-		 * when hashsets become faster in a HNSW-typical setting */
-		if capacity <= 5_000_000 {
-			HashOrBitset::new_bit(capacity)
-		} else {
-			HashOrBitset::new_hash(capacity)
-		}
-	}
-	#[inline(always)]
-	fn reserve(&mut self, additional: usize) {
-		match self {
-			HashOrBitset::Hash(h) => h.reserve(additional),
-			HashOrBitset::Bit(b) => b.reserve(additional),
-		}
-	}
-	#[inline(always)]
-	fn insert(&mut self, value: T) -> bool {
-		match self {
-			HashOrBitset::Hash(h) => h.insert(value),
-			HashOrBitset::Bit(b) => b.insert(value),
-		}
-	}
-	#[inline(always)]
-	fn contains(&self, value: &T) -> bool {
-		match self {
-			HashOrBitset::Hash(h) => h.contains(value),
-			HashOrBitset::Bit(b) => b.contains(value),
-		}
-	}
-	#[inline(always)]
-	fn clear(&mut self) {
-		match self {
-			HashOrBitset::Hash(h) => h.clear(),
-			HashOrBitset::Bit(b) => b.clear(),
-		}
-	}
-}
-#[test]
-fn test_hash_or_bitset() {
-	let mut vec: Vec<HashOrBitset<usize>> = Vec::new();
-	vec.push(HashOrBitset::new_bit(10));
-	vec.push(HashOrBitset::new_bit(1_000));
-	vec.push(HashOrBitset::new_bit(100_000));
-	vec.push(HashOrBitset::new_hash(10_000_000));
-	std::hint::black_box(&vec);
-}
 
 
 type HNSWBuildGraph<R,F> = WDirLoLGraph<R,F>;
@@ -385,7 +319,7 @@ pub trait HNSWStyleBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<
 	/// Result:
 	/// - entry_points is populated with up to max_build_heap_size (or max_heap_size_override) neighbors in ascending distance
 	/// - state of all other caches is undefined
-	fn _search_layer<M: MatrixDataSource<F>+Sync>(&self, mat: &M, i: usize, layer: usize, visited_set: &mut HashSet<R>, search_maxheap: &mut MaxHeap<F,R>, frontier_minheap: &mut MinHeap<F,R>, frontier_dualheap: &mut DualHeap<F,R>, entry_points: &mut Vec<(F,R)>, max_heap_size_override: Option<usize>) {
+	fn _search_layer<M: MatrixDataSource<F>+Sync>(&self, mat: &M, i: usize, layer: usize, visited_set: &mut impl HashSetLike<R>, search_maxheap: &mut MaxHeap<F,R>, frontier_minheap: &mut MinHeap<F,R>, frontier_dualheap: &mut DualHeap<F,R>, entry_points: &mut Vec<(F,R)>, max_heap_size_override: Option<usize>) {
 		let graph = &self._graphs()[layer];
 		visited_set.clear();
 		let max_heap_size = max_heap_size_override.unwrap_or(if layer==0 {self._max_build_heap_size()} else {1});
@@ -1180,26 +1114,24 @@ fn tri_to_cos<F: Float>(uv: F, uw: F, vw: F, dist_is_sq: bool) -> F {
 
 struct HNSWThreadCache<R: SyncUnsignedInteger, F: SyncFloat> {
 	entry_points: Vec<(F,R)>,
-	search_hashset: HashSet<R>,
-	heuristic_hashset: HashSet<R>,
+	search_hashsets: Vec<HashOrBitset<R>>,
+	heuristic_hashsets: Vec<HashOrBitset<R>>,
 	search_maxheap: MaxHeap<F,R>,
 	frontier_minheap: MinHeap<F,R>,
 	frontier_dualheap: DualHeap<F,R>,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat> HNSWThreadCache<R,F> {
-	fn new(n_data: usize, max_build_heap_size: usize, lowest_max_degree: usize, max_build_frontier_size: Option<usize>) -> Self {
+	fn new(layer_sizes: &Vec<usize>, max_build_heap_size: usize, _lowest_max_degree: usize, max_build_frontier_size: Option<usize>) -> Self {
 		let entry_points = Vec::with_capacity(max_build_heap_size);
-		let mut search_hashset = <HashSet<R> as HashSetLike<R>>::new(n_data);
-		search_hashset.reserve(max_build_heap_size*2);
-		let mut heuristic_hashset = <HashSet<R> as HashSetLike<R>>::new(n_data);
-		heuristic_hashset.reserve(lowest_max_degree*lowest_max_degree);
+		let search_hashsets = layer_sizes.iter().map(|&n| HashOrBitset::new(n)).collect();
+		let heuristic_hashsets = layer_sizes.iter().map(|&n| HashOrBitset::new(n)).collect();
 		let search_maxheap = MaxHeap::with_capacity(max_build_heap_size);
 		let frontier_minheap = MinHeap::with_capacity(if max_build_frontier_size.is_some() {0} else {max_build_heap_size});
 		let frontier_dualheap = DualHeap::with_capacity(max_build_frontier_size.unwrap_or(0));
 		HNSWThreadCache {
 			entry_points,
-			search_hashset,
-			heuristic_hashset,
+			search_hashsets,
+			heuristic_hashsets,
 			search_maxheap,
 			frontier_minheap,
 			frontier_dualheap,
@@ -1220,7 +1152,7 @@ pub struct HNSWParallelHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: D
 	level_norm_param: f32,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWParallelHeapBuilder<R, F, Dist> {
-	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>) {
+	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
 		/* Precompute all point levels */
 		let layer_sizes = (0..self.n_layers).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
 		let mut point_levels = Vec::with_capacity(self.n_data);
@@ -1317,21 +1249,21 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 			}
 		}
-		(point_levels, point_level_pos)
+		(layer_sizes, point_levels, point_level_pos)
 	}
 	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		/* Do nothing for empty datasets */
 		if self.n_data == 0 { return; }
 		/* Preallocate graphs and ID lookups and assign levels and level positions for each input */
-		let (point_levels, point_level_pos) = self.initialize_structure();
+		let (layer_sizes, point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
-		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let n_burnin: usize = self.params.n_parallel_burnin;
+		let mut burnin_cache = HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(1..n_burnin+1).for_each(|i| {
 			self.insert(0, mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
 		});
 		/* Insert edges to the graphs as per HNSW insertion rules */
-		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
+		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
 		let chunk_size = (self.n_data-n_burnin + self.n_threads - 1) / self.n_threads;
 		(1+n_burnin..self.n_data).step_by(chunk_size)
 		.map(|start| start..(start+chunk_size).min(self.n_data))
@@ -1381,13 +1313,13 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		thread_cache.entry_points.push((top_entry_dist, R::zero()));
 		/* Search entry point for the required level */
 		(level+1..self.n_layers).rev().for_each(|i_layer| {
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
 			let local_ids = &self.local_layer_ids[i_layer-1];
 			thread_cache.entry_points.iter_mut().for_each(|(_,j)| *j = unsafe{local_ids[j.to_usize().unwrap_unchecked()]});
 		});
 		(0..level+1).rev().for_each(|i_layer| {
 			if i_round > 0 { self.graphs[i_layer].view_neighbors_heap_mut(unsafe{R::from(i).unwrap_unchecked()}).clear(); }
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
 			self.insert_layer(mat, i, i_global, i_layer, thread_cache);
 			if i_layer > 0 {
 				let local_ids = &self.local_layer_ids[i_layer-1];
@@ -1399,7 +1331,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	fn insert_layer<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, i: usize, i_global: usize, layer: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
 		let neighbors = &mut thread_cache.entry_points;
 		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
-		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
+		let heuristic_hashset = unsafe{thread_cache.heuristic_hashsets.get_unchecked_mut(layer)};
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
 		/* Choose the appropriate max degree */
@@ -1412,14 +1344,14 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			/* Then bidirectionally link i to all of these neighbors */
 			/* Afterwards prune neighborhoods of all affected points back down to max_neighbors */
 			if !self.params.insert_heuristic {
-				thread_cache.search_hashset.clear();
-				thread_cache.search_hashset.insert(i);
+				heuristic_hashset.clear();
+				heuristic_hashset.insert(i);
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=thread_cache.search_hashset.insert(j));
+					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
 					neighbors.iter()
 					/* This should almost never matter, but this node can be found by another
 					 * searching thread while creating the adjacency list. */
-					.filter(|&&(_,j)| !thread_cache.search_hashset.contains(&j))
+					.filter(|&&(_,j)| !heuristic_hashset.contains(&j))
 					.take(max_neighbors)
 					.for_each(|&(d,j)| {
 						if i_adj.size() < max_neighbors {
@@ -1451,20 +1383,20 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 				remove_duplicates_with_key(&mut candidates, |(_,j)| j);
 				/* Prune neighborhoods with relative neighbor heuristic */
-				thread_cache.search_hashset.clear();
-				thread_cache.search_hashset.insert(i);
+				heuristic_hashset.clear();
+				heuristic_hashset.insert(i);
 				let mut tmp_list = Vec::with_capacity(candidates.len());
 				let mut cand_iter = candidates.into_iter().peekable();
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=thread_cache.search_hashset.insert(j));
-					while cand_iter.peek().is_some() && thread_cache.search_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
+					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
+					while cand_iter.peek().is_some() && heuristic_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
 					if cand_iter.peek().is_some() {
 						let (dij,j) = cand_iter.next().unwrap_unchecked();
 						i_adj.push(dij,j);
-						thread_cache.search_hashset.insert(j);
+						heuristic_hashset.insert(j);
 						for (dij,j) in cand_iter {
 							if i_adj.size() >= max_neighbors { break; }
-							if thread_cache.search_hashset.contains(&j) { continue; }
+							if heuristic_hashset.contains(&j) { continue; }
 							if i_adj.iter().all(|&(dik,k)| {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								let k_global = if layer>0 { self.global_layer_ids[layer-1][k.to_usize().unwrap_unchecked()] } else { k };
@@ -1637,7 +1569,7 @@ pub struct HNSWParallelSENHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist
 	level_norm_param: f32,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWParallelSENHeapBuilder<R, F, Dist> {
-	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>) {
+	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
 		/* Precompute all point levels */
 		let layer_sizes = (0..self.n_layers).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
 		let mut point_levels = Vec::with_capacity(self.n_data);
@@ -1734,21 +1666,21 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 			}
 		}
-		(point_levels, point_level_pos)
+		(layer_sizes, point_levels, point_level_pos)
 	}
 	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		/* Do nothing for empty datasets */
 		if self.n_data == 0 { return; }
 		/* Preallocate graphs and ID lookups and assign levels and level positions for each input */
-		let (point_levels, point_level_pos) = self.initialize_structure();
+		let (layer_sizes, point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
 		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let mut burnin_cache = HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(1..n_burnin+1).for_each(|i| {
 			self.insert(0, mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
 		});
 		/* Insert edges to the graphs as per HNSW insertion rules */
-		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
+		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
 		let chunk_size = (self.n_data-n_burnin + self.n_threads - 1) / self.n_threads;
 		(1+n_burnin..self.n_data).step_by(chunk_size)
 		.map(|start| start..(start+chunk_size).min(self.n_data))
@@ -1788,13 +1720,13 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		thread_cache.entry_points.push((top_entry_dist, R::zero()));
 		/* Search entry point for the required level */
 		(level+1..self.n_layers).rev().for_each(|i_layer| {
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
 			let local_ids = &self.local_layer_ids[i_layer-1];
 			thread_cache.entry_points.iter_mut().for_each(|(_,j)| *j = unsafe{local_ids[j.to_usize().unwrap_unchecked()]});
 		});
 		(0..level+1).rev().for_each(|i_layer| {
 			if i_round > 0 {self.graphs[i_layer].view_neighbors_heap_mut(unsafe{R::from_usize(i).unwrap_unchecked()}).clear();}
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
 			self.insert_layer(mat, i, i_global, i_layer, thread_cache);
 			if i_layer > 0 {
 				let local_ids = &self.local_layer_ids[i_layer-1];
@@ -1816,7 +1748,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		let protected_neighbors = 0;
 		let neighbors = &mut thread_cache.entry_points;
 		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
-		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
+		let heuristic_hashset = unsafe{thread_cache.heuristic_hashsets.get_unchecked_mut(layer)};
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
 		/* Unsafe graph reference to have `self` accessible downstream */
@@ -1827,14 +1759,14 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			/* Then bidirectionally link i to all of these neighbors */
 			/* Afterwards prune neighborhoods of all affected points back down to max_neighbors */
 			if !self.params.insert_heuristic {
-				thread_cache.search_hashset.clear();
-				thread_cache.search_hashset.insert(i);
+				heuristic_hashset.clear();
+				heuristic_hashset.insert(i);
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=thread_cache.search_hashset.insert(j));
+					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
 					neighbors.iter()
 					/* This should almost never matter, but this node can be found by another
 					 * searching thread while creating the adjacency list. */
-					.filter(|&&(_,j)| !thread_cache.search_hashset.contains(&j))
+					.filter(|&&(_,j)| !heuristic_hashset.contains(&j))
 					.take(max_neighbors)
 					.for_each(|&(d,j)| {
 						if i_adj.size() < max_neighbors {
@@ -1866,20 +1798,20 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 				remove_duplicates_with_key(&mut candidates, |(_,j)| j);
 				/* Prune neighborhoods with relative neighbor heuristic */
-				thread_cache.search_hashset.clear();
-				thread_cache.search_hashset.insert(i);
+				heuristic_hashset.clear();
+				heuristic_hashset.insert(i);
 				let mut tmp_list = Vec::with_capacity(candidates.len());
 				let mut cand_iter = candidates.into_iter().peekable();
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=thread_cache.search_hashset.insert(j));
-					while cand_iter.peek().is_some() && thread_cache.search_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
+					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
+					while cand_iter.peek().is_some() && heuristic_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
 					if cand_iter.peek().is_some() {
 						let (dij,j) = cand_iter.next().unwrap_unchecked();
 						i_adj.push(dij,j);
-						thread_cache.search_hashset.insert(j);
+						heuristic_hashset.insert(j);
 						for (dij,j) in cand_iter {
 							if i_adj.size() >= max_neighbors { break; }
-							if thread_cache.search_hashset.contains(&j) { continue; }
+							if heuristic_hashset.contains(&j) { continue; }
 							if i_adj.iter().all(|&(dik,k)| {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								let k_global = if layer>0 { self.global_layer_ids[layer-1][k.to_usize().unwrap_unchecked()] } else { k };
@@ -2078,7 +2010,7 @@ pub struct HNSWParallelPresortedHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat
 	level_norm_param: f32,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWParallelPresortedHeapBuilder<R, F, Dist> {
-	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>) {
+	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
 		/* Precompute all point levels */
 		let layer_sizes = (0..self.n_layers).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
 		let mut point_levels = Vec::with_capacity(self.n_data);
@@ -2175,19 +2107,19 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 			}
 		}
-		(point_levels, point_level_pos)
+		(layer_sizes, point_levels, point_level_pos)
 	}
 	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		/* Do nothing for empty datasets */
 		if self.n_data == 0 { return; }
 		/* Preallocate graphs and ID lookups and assign levels and level positions for each input */
-		let (point_levels, point_level_pos) = self.initialize_structure();
+		let (layer_sizes, point_levels, point_level_pos) = self.initialize_structure();
 		let mut order = (1..self.n_data).collect::<Vec<_>>();
 		order.par_sort_unstable_by(|&i,&j| point_levels[j].cmp(&point_levels[i]));
 		println!("{:?}", order[0..50].iter().map(|&i| (i,point_levels[i])).collect::<Vec<_>>());
 		/* Burnin single thread for a few samples */
 		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let mut burnin_cache = HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(0..n_burnin).for_each(|i| {
 			let i = order[i];
 			self.insert(mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
@@ -2197,7 +2129,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		(n_burnin..self.n_data-1).step_by(chunk_size)
 		.map(|start| start..(start+chunk_size).min(self.n_data-1))
 		.par_bridge().for_each(|chunk| {
-			let mut thread_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+			let mut thread_cache = HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 			let unsafe_self_ref = std::ptr::addr_of!(*self) as *mut Self;
 			#[cfg(debug_assertions)]
 			unsafe { /* Ensure that the self ref actually works */
@@ -2224,12 +2156,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		thread_cache.entry_points.push((top_entry_dist, R::zero()));
 		/* Search entry point for the required level */
 		(level+1..self.n_layers).rev().for_each(|i_layer| {
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
 			let local_ids = &self.local_layer_ids[i_layer-1];
 			thread_cache.entry_points.iter_mut().for_each(|(_,j)| *j = unsafe{local_ids[j.to_usize().unwrap_unchecked()]});
 		});
 		(0..level+1).rev().for_each(|i_layer| {
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
 			self.insert_layer(mat, i, i_global, i_layer, thread_cache);
 			if i_layer > 0 {
 				let local_ids = &self.local_layer_ids[i_layer-1];
@@ -2241,7 +2173,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	fn insert_layer<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, i: usize, i_global: usize, layer: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
 		let neighbors = &mut thread_cache.entry_points;
 		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
-		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
+		let heuristic_hashset = unsafe{thread_cache.heuristic_hashsets.get_unchecked_mut(layer)};
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
 		/* Choose the appropriate max degree */
@@ -2254,14 +2186,14 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			/* Then bidirectionally link i to all of these neighbors */
 			/* Afterwards prune neighborhoods of all affected points back down to max_neighbors */
 			if !self.params.insert_heuristic {
-				thread_cache.search_hashset.clear();
-				thread_cache.search_hashset.insert(i);
+				heuristic_hashset.clear();
+				heuristic_hashset.insert(i);
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=thread_cache.search_hashset.insert(j));
+					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
 					neighbors.iter()
 					/* This should almost never matter, but this node can be found by another
 					 * searching thread while creating the adjacency list. */
-					.filter(|&&(_,j)| !thread_cache.search_hashset.contains(&j))
+					.filter(|&&(_,j)| !heuristic_hashset.contains(&j))
 					.take(max_neighbors)
 					.for_each(|&(d,j)| {
 						if i_adj.size() < max_neighbors {
@@ -2293,20 +2225,20 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 				remove_duplicates_with_key(&mut candidates, |(_,j)| j);
 				/* Prune neighborhoods with relative neighbor heuristic */
-				thread_cache.search_hashset.clear();
-				thread_cache.search_hashset.insert(i);
+				heuristic_hashset.clear();
+				heuristic_hashset.insert(i);
 				let mut tmp_list = Vec::with_capacity(candidates.len());
 				let mut cand_iter = candidates.into_iter().peekable();
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=thread_cache.search_hashset.insert(j));
-					while cand_iter.peek().is_some() && thread_cache.search_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
+					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
+					while cand_iter.peek().is_some() && heuristic_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
 					if cand_iter.peek().is_some() {
 						let (dij,j) = cand_iter.next().unwrap_unchecked();
 						i_adj.push(dij,j);
-						thread_cache.search_hashset.insert(j);
+						heuristic_hashset.insert(j);
 						for (dij,j) in cand_iter {
 							if i_adj.size() >= max_neighbors { break; }
-							if thread_cache.search_hashset.contains(&j) { continue; }
+							if heuristic_hashset.contains(&j) { continue; }
 							if i_adj.iter().all(|&(dik,k)| {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								let k_global = if layer>0 { self.global_layer_ids[layer-1][k.to_usize().unwrap_unchecked()] } else { k };
@@ -2409,7 +2341,7 @@ pub struct HNSWParallelHeapBuilder2<R: SyncUnsignedInteger, F: SyncFloat, Dist: 
 	rev_edge_cache: Vec<Vec<(usize,R,R,F)>>,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWParallelHeapBuilder2<R, F, Dist> {
-	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>) {
+	fn initialize_structure(&mut self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
 		/* Precompute all point levels */
 		let layer_sizes = (0..self.n_layers).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
 		let mut point_levels = Vec::with_capacity(self.n_data);
@@ -2506,16 +2438,16 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 			}
 		}
-		(point_levels, point_level_pos)
+		(layer_sizes, point_levels, point_level_pos)
 	}
 	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		/* Do nothing for empty datasets */
 		if self.n_data == 0 { return; }
 		/* Preallocate graphs and ID lookups and assign levels and level positions for each input */
-		let (point_levels, point_level_pos) = self.initialize_structure();
+		let (layer_sizes, point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
 		let n_burnin = self.params.n_parallel_burnin;
-		let mut burnin_cache = HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
+		let mut burnin_cache = HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		let mut rev_edges = Vec::new();
 		(1..n_burnin+1).for_each(|i| {
 			rev_edges.clear();
@@ -2538,7 +2470,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		});
 		/* Insert edges to the graphs as per HNSW insertion rules */
 		let chunk_size = self.n_threads * self.params.insert_minibatch_size;
-		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(self.n_data, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
+		let mut thread_caches = (0..self.n_threads).map(|_| HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size)).collect::<Vec<_>>();
 		let insert_minibatch_size = self.params.insert_minibatch_size;
 		let n_data = self.n_data;
 		(1+n_burnin..self.n_data).step_by(chunk_size)
@@ -2567,12 +2499,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		thread_cache.entry_points.push((top_entry_dist, R::zero()));
 		/* Search entry point for the required level */
 		(level+1..self.n_layers).rev().for_each(|i_layer| {
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, None);
 			let local_ids = &self.local_layer_ids[i_layer-1];
 			thread_cache.entry_points.iter_mut().for_each(|(_,j)| *j = unsafe{local_ids[j.to_usize().unwrap_unchecked()]});
 		});
 		(0..level+1).rev().for_each(|i_layer| {
-			self._search_layer(mat, i_global, i_layer, &mut thread_cache.search_hashset, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
+			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
 			self.insert_layer(mat, i, i_global, i_layer, thread_cache, rev_edges);
 			if i_layer > 0 {
 				let local_ids = &self.local_layer_ids[i_layer-1];
@@ -2584,7 +2516,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	fn insert_layer<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, i: usize, i_global: usize, layer: usize, thread_cache: &mut HNSWThreadCache<R,F>, rev_edges: &mut Vec<(usize,R,R,F)>) {
 		let neighbors = &mut thread_cache.entry_points;
 		debug_assert_eq!(neighbors.len(), neighbors.iter().map(|(_,j)| j).collect::<std::collections::HashSet<_>>().len());
-		let heuristic_hashset = &mut thread_cache.heuristic_hashset;
+		let heuristic_hashset = unsafe{thread_cache.heuristic_hashsets.get_unchecked_mut(layer)};
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
 		/* Choose the appropriate max degree */
@@ -2625,19 +2557,19 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				});
 				remove_duplicates_with_key(&mut candidates, |(_,j)| j);
 				/* Prune neighborhoods with relative neighbor heuristic */
-				thread_cache.search_hashset.clear();
-				thread_cache.search_hashset.insert(i);
+				heuristic_hashset.clear();
+				heuristic_hashset.insert(i);
 				let mut tmp_list = Vec::with_capacity(candidates.len());
 				let mut cand_iter = candidates.into_iter().peekable();
-				i_adj.iter().for_each(|&(_,j)| _=thread_cache.search_hashset.insert(j));
-				while cand_iter.peek().is_some() && thread_cache.search_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
+				i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
+				while cand_iter.peek().is_some() && heuristic_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
 				if cand_iter.peek().is_some() {
 					let (dij,j) = cand_iter.next().unwrap_unchecked();
 					i_adj.push(dij,j);
-					thread_cache.search_hashset.insert(j);
+					heuristic_hashset.insert(j);
 					for (dij,j) in cand_iter {
 						if i_adj.size() >= max_neighbors { break; }
-						if thread_cache.search_hashset.contains(&j) { continue; }
+						if heuristic_hashset.contains(&j) { continue; }
 						if i_adj.iter().all(|&(dik,k)| {
 							let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 							let k_global = if layer>0 { self.global_layer_ids[layer-1][k.to_usize().unwrap_unchecked()] } else { k };
