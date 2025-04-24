@@ -142,7 +142,8 @@ fn make_random_graph<
 	M: MatrixDataSource<F>+Sync,
 >(mat: &M, graph: &mut RNNBuildGraph<R,F>, dist: &Dist, out_degree: usize) {
 	let n_data = mat.n_rows();
-	(0..n_data).for_each(|_| graph.add_node());
+	graph.reserve(n_data);
+	(0..n_data).for_each(|_| graph.add_node_with_capacity(out_degree));
 	/* Partition the workload into equal size for each thread */
 	let n_threads = current_num_threads();
 	let thread_chunk_size = (n_data + n_threads - 1) / n_threads;

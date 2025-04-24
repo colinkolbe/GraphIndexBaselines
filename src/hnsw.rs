@@ -2,6 +2,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Mutex;
 
+use graphidx::bit_vectors::BitVector;
+use graphidx::bit_vectors::BitVectorMut;
 use graphidx::graphs::*;
 use graphidx::heaps::*;
 use graphidx::random::RandomPermutationGenerator;
@@ -11,6 +13,7 @@ use graphidx::measures::*;
 use graphidx::data::*;
 use graphidx::sets::{HashSetLike,HashOrBitset};
 use rayon::current_num_threads;
+use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSlice;
@@ -1257,7 +1260,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		/* Preallocate graphs and ID lookups and assign levels and level positions for each input */
 		let (layer_sizes, point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
-		let n_burnin: usize = self.params.n_parallel_burnin;
+		let n_burnin: usize = self.params.n_parallel_burnin.min(self.n_data-1);
 		let mut burnin_cache = HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(1..n_burnin+1).for_each(|i| {
 			self.insert(0, mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
@@ -1537,6 +1540,125 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 	}
 
 }
+
+
+
+pub struct FloodingHNSWBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
+	_phantom: std::marker::PhantomData<F>,
+	params: HNSWParams,
+	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
+	local_layer_ids: Vec<Vec<R>>,
+	global_layer_ids: Vec<Vec<R>>,
+	dist: Dist,
+}
+impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> FloodingHNSWBuilder<R, F, Dist> {
+	fn flood_select<G: Graph<R>+Sync>(graph: &G, max_degree: usize) -> Vec<R> {
+		let n_vertices = graph.n_vertices();
+		let mut in_edges: Vec<Vec<R>> = vec![Vec::with_capacity(max_degree); n_vertices];
+		unsafe {
+			(0..n_vertices).for_each(|i| {
+				let i = R::from_usize(i).unwrap_unchecked();
+				graph.iter_neighbors(i).for_each(|j| {
+					in_edges[j.to_usize().unwrap_unchecked()].push(i);
+				});
+			});
+		}
+		let n_buckets = (n_vertices+63)/64;
+		let selected = vec![0u64; n_buckets];
+		let perm = RandomPermutationGenerator::new(n_vertices, 4);
+		unsafe {
+			let n_threads = rayon::current_num_threads();
+			let chunk_size = (n_vertices + n_threads - 1) / n_threads;
+			(0..n_threads).into_par_iter().map(|i_chunk| {
+				let start = chunk_size * i_chunk;
+				let end = (start+chunk_size).min(n_vertices);
+				let mut selected_idxs = Vec::with_capacity(chunk_size);
+				let unsafe_selected = std::ptr::addr_of!(selected) as *const Vec<u64> as *mut Vec<u64>;
+				(start..end).for_each(|i| {
+					let i = perm.apply_rounds(i);
+					let covered = in_edges.get_unchecked(i).iter().any(|j| {
+						selected.get_bit_unchecked(j.to_usize().unwrap_unchecked()/64)
+					});
+					if !covered {
+						unsafe_selected.as_mut().unwrap_unchecked().set_bit_unchecked(i/64, true);
+						selected_idxs.push(R::from(i).unwrap_unchecked());
+					}
+				});
+				selected_idxs
+			}).collect::<Vec<Vec<R>>>().into_iter()
+			.map(|v| v.into_iter())
+			.flatten().collect()
+		}
+	}
+	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
+		let param_max_layers = self.params.max_layers;
+		self.params.max_layers = 1;
+		let lowest_level_builder: HNSWParallelHeapBuilder<R, F, Dist> = HNSWParallelHeapBuilder::base_init(mat, self.dist.clone(), self.params.clone());
+		let (mut graphs,_,_,_) = lowest_level_builder._into_parts();
+		self.graphs.push(graphs.pop().unwrap());
+		unsafe {
+			for i_layer in 1..param_max_layers {
+				if self.graphs.last().unwrap().n_vertices() < self.params.higher_max_degree { break; }
+				let local_ids: Vec<R> = Self::flood_select(&self.graphs[i_layer-1], self.params.lowest_max_degree);
+				let global_ids: Vec<R> = if i_layer==1 {
+					local_ids.iter().cloned().collect()
+				} else {
+					local_ids.iter().map(|&i| {
+						self.global_layer_ids[i_layer-2][i.to_usize().unwrap_unchecked()]
+					}).collect()
+				};
+				self.local_layer_ids.push(local_ids);
+				self.global_layer_ids.push(global_ids);
+				let local_data = mat.get_rows(&self.global_layer_ids[i_layer-1].iter().map(|v| v.to_usize().unwrap_unchecked()).collect::<Vec<_>>());
+				self.params.lowest_max_degree = self.params.higher_max_degree;
+				let curr_level_builder = HNSWParallelHeapBuilder::base_init(&local_data, self.dist.clone(), self.params.clone());
+				let (mut curr_graphs, _, _, _) = curr_level_builder._into_parts();
+				self.graphs.push(curr_graphs.pop().unwrap());
+			}
+		}
+	}
+}
+impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for FloodingHNSWBuilder<R, F, Dist> {
+	type Params = HNSWParams;
+	type Graph = HNSWHeapBuildGraph<R,F>;
+	#[inline(always)]
+	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
+	#[inline(always)]
+	fn _graphs(&self) -> &Vec<HNSWHeapBuildGraph<R,F>> { &self.graphs }
+	#[inline(always)]
+	fn _global_layer_ids(&self) -> &Vec<Vec<R>> { &self.global_layer_ids }
+	#[inline(always)]
+	fn _dist(&self) -> &Dist { &self.dist }
+	#[inline(always)]
+	fn _max_build_heap_size(&self) -> usize { self.params.max_build_heap_size }
+	#[inline(always)]
+	fn _max_build_frontier_size(&self) -> Option<usize> { self.params.max_build_frontier_size }
+	#[inline(always)]
+	fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
+		(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
+	}
+	#[inline(always)]
+	fn _max_degrees(&self) -> (usize, usize) {
+		(self.params.lowest_max_degree, self.params.higher_max_degree)
+	}
+	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
+		let n_data = mat.n_rows();
+		assert!(n_data < R::max_value().to_usize().unwrap());
+		let mut builder = Self {
+			_phantom: std::marker::PhantomData,
+			params,
+			graphs: vec![],
+			local_layer_ids: vec![],
+			global_layer_ids: vec![],
+			dist,
+		};
+		builder.train(mat);
+		builder
+	}
+
+}
+
+
 
 
 
@@ -2895,6 +3017,18 @@ mod tests {
 		.with_insert_heuristic_extend(false);
 		let graph_time = std::time::Instant::now();
 		let _graph = HNSWBuilder::<u64,_,_>::build_fat(data, EuclideanDistance::new(), params, 1);
+		println!("Graph construction: {:.2?}", graph_time.elapsed());
+	}
+	
+	#[test]
+	fn flooding_hnsw_construction() {
+		let (n,d) = (10_000, 20);
+		let rng = Normal::new(0.0, 1.0).unwrap();
+		let data: Array2<f64> = Array2::from_shape_fn((n, d), |_| rng.sample(&mut rand::thread_rng()));
+		let params = HNSWParams::new()
+		.with_insert_heuristic_extend(false);
+		let graph_time = std::time::Instant::now();
+		let _graph = FloodingHNSWBuilder::<u64,_,_>::build(data, EuclideanDistance::new(), params, 1);
 		println!("Graph construction: {:.2?}", graph_time.elapsed());
 	}
 	
