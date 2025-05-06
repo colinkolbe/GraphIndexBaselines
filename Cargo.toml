@@ -14,6 +14,7 @@ doc = true
 
 [dependencies]
 graphidx = { path = "../GraphIndexAPI", default-features = false }
+hsgf_lib = { path = "../hsgf/hsgf_lib", default-features = false }
 num = "0.4.0"
 ndarray = "0.15" # Has to be the same as used by hdf5 to work
 ndarray-rand = "0.14.0"
