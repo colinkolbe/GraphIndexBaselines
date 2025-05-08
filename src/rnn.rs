@@ -1541,15 +1541,31 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F> + Sync + Send>
     HSGFLevelGraphStyleBuilder<R, F, Dist> for RNNDescentBuilder<R, F, Dist>
 {
     type Params = RNNParams;
+	fn get_builder(dist: Dist, params: &Self::Params) -> Self {
+		Self {
+			_phantom: std::marker::PhantomData,
+			n_data: 0,
+			params: params.clone(),
+			node_locks: Vec::new(),
+			rev_edge_cache: Vec::new(),
+			add_edge_cache: Vec::new(),
+			graph: RNNBuildGraph::new(),
+			dist,
+		}
+	}
     fn construct_level_graph<M: MatrixDataSource<F> + Sync>(
         &mut self,
         mat: &M,
     ) -> (HSGFLevelGraph<R, F>, Vec<Vec<(F, R)>>) {
-		let reduce_degree = self.n_data; // hacky!
+		// init/reset
+		let reduce_degree = self.params.reduce_degree;
 		let n_data = mat.n_rows();
+		self.n_data = n_data;
 		self.node_locks = (0..n_data).map(|_| Mutex::new(())).collect();
 		self.rev_edge_cache = (0..n_data).map(|_| Vec::with_capacity(2*reduce_degree)).collect();
-		self.n_data = n_data;
+		self.add_edge_cache = Vec::new();
+		self.graph = RNNBuildGraph::new();
+
 		self.init_random(mat);
         self.train(mat);
 
@@ -1557,19 +1573,5 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F> + Sync + Send>
             self.graph.as_weighted_dir_lol_graph(),
 			self.graph.adjacency.iter().map(|neighbors| neighbors.iter().map(|&(a,b,_)| (a,b)).collect()).collect()
         )
-    }
-
-    fn get_builder(dist: Dist, params: &Self::Params) -> Self {
-        let reduce_degree = params.reduce_degree;
-        Self {
-            _phantom: std::marker::PhantomData,
-			n_data: reduce_degree, // hacky!
-			params: params.clone(),
-			node_locks: Vec::new(),
-			rev_edge_cache: Vec::new(),
-			add_edge_cache: Vec::new(),
-			graph: RNNBuildGraph::new(),
-			dist,
-        }
     }
 }
