@@ -1556,7 +1556,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F> + Sync + Send>
     fn construct_level_graph<M: MatrixDataSource<F> + Sync>(
         &mut self,
         mat: &M,
-    ) -> (HSGFLevelGraph<R, F>, Vec<Vec<(F, R)>>) {
+    ) -> HSGFLevelGraph<R, F> {
 		// init/reset
 		let reduce_degree = self.params.reduce_degree;
 		let n_data = mat.n_rows();
@@ -1569,9 +1569,6 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F> + Sync + Send>
 		self.init_random(mat);
         self.train(mat);
 
-        (
-            self.graph.as_weighted_dir_lol_graph(),
-			self.graph.adjacency.iter().map(|neighbors| neighbors.iter().map(|&(a,b,_)| (a,b)).collect()).collect()
-        )
+		self.graph.as_weighted_dir_lol_graph()
     }
 }
