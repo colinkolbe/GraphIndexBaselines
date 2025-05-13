@@ -42,7 +42,7 @@ default = ["python"]
 python = ["pyo3", "numpy"]
 
 [profile.release]
-# features = ["python"]
+features = ["python"]
 opt-level = 3
 lto = true
 codegen-units = 1
