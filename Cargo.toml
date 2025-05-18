@@ -38,29 +38,32 @@ numpy = { version = "0.23.0" }
 # criterion = { version = "0.5.1", features = ['html_reports'] }
 
 [features]
-default = ["python"]
+default = []
 python = ["pyo3", "numpy"]
 
-[profile.release]
-features = ["python"]
-opt-level = 3
-lto = true
-codegen-units = 1
+# [profile.release]
+# features = ["python"]
+# opt-level = 3
+# lto = true
+# codegen-units = 1
 
-[profile.dev]
-features = ["python"]
+# [profile.dev]
+# features = ["python"]
+
+[profile.test]
+inherits = "release"
 
 [profile.release-with-debug]
 inherits = "release"
 debug = true
 strip = false
 
-[profile.bench]
-inherits = "release"
-features = []
+# [profile.bench]
+# inherits = "release"
+# features = []
 
-[[bench]]
-name = "bench"
+# [[bench]]
+# name = "bench"
 # harness = false
 
 

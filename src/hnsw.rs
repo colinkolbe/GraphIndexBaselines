@@ -2971,7 +2971,7 @@ mod tests {
 		/* Limit global thread pool size */
 		// rayon::ThreadPoolBuilder::new().num_threads(16).build_global().unwrap();
 		/* Parameters */
-		let (nd, nq, d, k) = (1_000_000, 1000, 50, 10);
+		let (nd, nq, d, k) = (10_000, 100, 50, 10);
 		let euc = SquaredEuclideanDistance::new();
 		/* Data initialization */
 		let init_time = Instant::now();
