@@ -1541,6 +1541,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F> + Sync + Send>
     HSGFLevelGraphStyleBuilder<R, F, Dist> for RNNDescentBuilder<R, F, Dist>
 {
     type Params = RNNParams;
+	type AddArgs = Option<()>;
 	fn get_builder(dist: Dist, params: &Self::Params) -> Self {
 		Self {
 			_phantom: std::marker::PhantomData,
@@ -1556,6 +1557,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F> + Sync + Send>
     fn construct_level_graph<M: MatrixDataSource<F> + Sync>(
         &mut self,
         mat: &M,
+		_add_args: Self::AddArgs,
     ) -> HSGFLevelGraph<R, F> {
 		// init/reset
 		let reduce_degree = self.params.reduce_degree;
