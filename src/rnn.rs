@@ -317,23 +317,91 @@ pub trait RNNStyleBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F
 			self._dist().dist(&mat.get_row(i), &mat.get_row(j))
 		}
 	}
-	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self;
-	#[inline(always)]
-	fn build<M: MatrixDataSource<F>+Sync>(mat: M, dist: Dist, params: Self::Params) -> GreedySingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
-		let builder = Self::base_init(&mat, dist, params);
-		let (graph, dist) = builder._into_graph_dist();
-		make_greedy_index(graph, mat, dist)
-	}
-	#[inline(always)]
-	fn build_capped<M: MatrixDataSource<F>+Sync>(mat: M, dist: Dist, params: Self::Params, max_frontier_size: usize) -> GreedyCappedSingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
-		let builder = Self::base_init(&mat, dist, params);
-		let (graph, dist) = builder._into_graph_dist();
-		make_greedy_capped_index(graph, mat, dist, max_frontier_size)
-	}
+	/// Creates a new RNN style builder instance, allocates some memory and stores the parameters
+	fn new<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self;
+	/// Randomly initializes the graph
 	#[inline(always)]
 	fn init_random<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		let (dist, initial_degree) = (self._dist() as *const Dist, self._initial_degree());
 		make_random_graph(mat, self._mut_graph(), unsafe{dist.as_ref().unwrap()}, initial_degree);
+	}
+	/// Trains the graph by applying RNN descent or similar routine
+	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M);
+	/// Creates a new RNN style builder instance using a given graph
+	#[inline(always)]
+	fn from_graph<M: MatrixDataSource<F>+Sync, G: Graph<R>>(mat: &M, graph: &G, dist: Dist, params: Self::Params) -> Self {
+		let mut builder = Self::new(&mat, dist.clone(), params);
+		let n_vertices = graph.n_vertices();
+		let rnn_graph = builder._mut_graph();
+		rnn_graph.reserve(n_vertices);
+		unsafe {
+			(0..n_vertices)
+			.map(|u| (u,R::from_usize(u).unwrap_unchecked()))
+			.for_each(|(u_usize, u)| {
+				let u_degree = graph.degree(u);
+				rnn_graph.add_node_with_capacity(u_degree);
+				graph.foreach_neighbor(u, |&v| {
+					let v_usize = v.to_usize().unwrap_unchecked();
+					let dist = if M::SUPPORTS_ROW_VIEW {
+						dist.dist_slice(mat.get_row_view(u_usize), mat.get_row_view(v_usize))
+					}else {
+						dist.dist(&mat.get_row(u_usize), &mat.get_row(v_usize))
+					};
+					rnn_graph.get_adj_mut(u).push((dist,v,true));
+				});
+			});
+		}
+		builder.train(mat);
+		builder
+	}
+	/// Creates a new RNN style builder instance using a given weighted graph
+	#[inline(always)]
+	fn from_weighted_graph<M: MatrixDataSource<F>+Sync, G: WeightedGraph<R,F>>(mat: &M, graph: &G, dist: Dist, params: Self::Params) -> Self {
+		let mut builder = Self::new(&mat, dist, params);
+		let n_vertices = graph.n_vertices();
+		let rnn_graph = builder._mut_graph();
+		rnn_graph.reserve(n_vertices);
+		unsafe {
+			(0..n_vertices)
+			.map(|u| R::from_usize(u).unwrap_unchecked())
+			.for_each(|u| {
+				let u_degree = graph.degree(u);
+				rnn_graph.add_node_with_capacity(u_degree);
+				graph.foreach_neighbor_with_zipped_weight(u, |&dist, &v| {
+					rnn_graph.get_adj_mut(u).push((dist,v,true));
+				});
+			});
+		}
+		builder.train(mat);
+		builder
+	}
+	/// Transforms a trained RNN style builder into a greedy index
+	#[inline(always)]
+	fn into_greedy<M: MatrixDataSource<F>+Sync>(self, mat: M) -> GreedySingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
+		let (graph, dist) = self._into_graph_dist();
+		make_greedy_index(graph, mat, dist)
+	}
+	/// Transforms a trained RNN style builder into a capped greedy index
+	#[inline(always)]
+	fn into_greedy_capped<M: MatrixDataSource<F>+Sync>(self, mat: M, max_frontier_size: usize) -> GreedyCappedSingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
+		let (graph, dist) = self._into_graph_dist();
+		make_greedy_capped_index(graph, mat, dist, max_frontier_size)
+	}
+	/// Shorthand for new, init_random, train, into_greedy
+	#[inline(always)]
+	fn build<M: MatrixDataSource<F>+Sync>(mat: M, dist: Dist, params: Self::Params) -> GreedySingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
+		let mut builder = Self::new(&mat, dist, params);
+		builder.init_random(&mat);
+		builder.train(&mat);
+		builder.into_greedy(mat)
+	}
+	/// Shorthand for new, init_random, train, into_greedy_capped
+	#[inline(always)]
+	fn build_capped<M: MatrixDataSource<F>+Sync>(mat: M, dist: Dist, params: Self::Params, max_frontier_size: usize) -> GreedyCappedSingleGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
+		let mut builder = Self::new(&mat, dist, params);
+		builder.init_random(&mat);
+		builder.train(&mat);
+		builder.into_greedy_capped(mat, max_frontier_size)
 	}
 }
 
@@ -357,24 +425,6 @@ pub struct RNNDescentBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distanc
 	dist: Dist,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNDescentBuilder<R, F, Dist> {
-	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
-		self.graph.reserve(self.n_data);
-		let (n_outer_loops, n_inner_loops) = (self.params.n_outer_loops, self.params.n_outer_loops);
-		(0..n_outer_loops).for_each(|i| {
-			(0..n_inner_loops).for_each(|_j| {
-				self.update_neighbors(mat);
-				#[cfg(debug_assertions)]
-				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, _j, self.graph.n_vertices(), self.graph.n_edges());
-			});
-			if i != n_outer_loops-1 {
-				self.add_reverse_edges();
-				#[cfg(debug_assertions)]
-				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, n_inner_loops, self.graph.n_vertices(), self.graph.n_edges());
-			}
-		});
-		/* Sanity check to ensure the graph is simple directed */
-		// self.remove_duplicate_edges();
-	}
 	fn update_neighbors<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		let thread_chunk_size = self.params.concurrent_batch_size;
 		let global_chunk_size = thread_chunk_size*current_num_threads();
@@ -526,12 +576,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNStyle
 	fn _initial_degree(&self) -> usize { self.params.initial_degree }
 	#[inline(always)]
 	fn _into_graph_dist(self) -> (RNNBuildGraph<R,F>, Dist) { (self.graph, self.dist) }
-	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
+	fn new<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
 		assert!(n_data < R::max_value().to_usize().unwrap());
 		let graph = RNNBuildGraph::new();
 		let reduce_degree = params.reduce_degree;
-		let mut builder = Self {
+		Self {
 			_phantom: std::marker::PhantomData,
 			n_data,
 			params,
@@ -540,10 +590,25 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNStyle
 			add_edge_cache: Vec::new(),
 			graph,
 			dist,
-		};
-		builder.init_random(mat);
-		builder.train(mat);
-		builder
+		}
+	}
+	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
+		self.graph.reserve(self.n_data);
+		let (n_outer_loops, n_inner_loops) = (self.params.n_outer_loops, self.params.n_outer_loops);
+		(0..n_outer_loops).for_each(|i| {
+			(0..n_inner_loops).for_each(|_j| {
+				self.update_neighbors(mat);
+				#[cfg(debug_assertions)]
+				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, _j, self.graph.n_vertices(), self.graph.n_edges());
+			});
+			if i != n_outer_loops-1 {
+				self.add_reverse_edges();
+				#[cfg(debug_assertions)]
+				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, n_inner_loops, self.graph.n_vertices(), self.graph.n_edges());
+			}
+		});
+		/* Sanity check to ensure the graph is simple directed */
+		// self.remove_duplicate_edges();
 	}
 }
 
@@ -573,25 +638,6 @@ pub struct RNNEgoDescentBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Dist
 	dist: Dist,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNEgoDescentBuilder<R, F, Dist> {
-	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
-		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum::<usize>());
-		println!("After initialization, Nodes: {:?}, Edges: {:?}", self.graph.n_vertices(), self.graph.n_edges());
-		(0..self.params.n_loops).for_each(|_i| {
-			if _i > 0 {
-				let mut add_edges = (0..self.graph.n_vertices()).map(|u| {
-					let u = R::from_usize(u).unwrap();
-					self.graph.get_adj(u).iter()
-					.map(move |&(dist,v,_)| (v,u,dist))
-				}).flatten().collect();
-				batch_add_edges(&mut self.graph, false, &mut add_edges);
-			}
-			self.update_neighbors(mat);
-			// #[cfg(debug_assertions)]
-			println!("Loop: {:?}, Nodes: {:?}, Edges: {:?}", _i, self.graph.n_vertices(), self.graph.n_edges());
-		});
-		/* Sanity check to ensure the graph is simple directed */
-		// self.remove_duplicate_edges();
-	}
 	fn update_neighbors<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		let n_threads = current_num_threads();
 		let thread_chunk_size = self.params.concurrent_batch_size;
@@ -690,21 +736,37 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNStyle
 	fn _initial_degree(&self) -> usize { self.params.initial_degree }
 	#[inline(always)]
 	fn _into_graph_dist(self) -> (RNNBuildGraph<R,F>, Dist) { (self.graph, self.dist) }
-	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
+	fn new<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
 		assert!(n_data < R::max_value().to_usize().unwrap());
 		let graph = RNNBuildGraph::new();
-		let mut builder = Self {
+		Self {
 			_phantom: std::marker::PhantomData,
 			n_data,
 			params,
 			node_locks: (0..n_data).map(|_| Mutex::new(())).collect(),
 			graph,
 			dist,
-		};
-		builder.init_random(mat);
-		builder.train(mat);
-		builder
+		}
+	}
+	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
+		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum::<usize>());
+		println!("After initialization, Nodes: {:?}, Edges: {:?}", self.graph.n_vertices(), self.graph.n_edges());
+		(0..self.params.n_loops).for_each(|_i| {
+			if _i > 0 {
+				let mut add_edges = (0..self.graph.n_vertices()).map(|u| {
+					let u = R::from_usize(u).unwrap();
+					self.graph.get_adj(u).iter()
+					.map(move |&(dist,v,_)| (v,u,dist))
+				}).flatten().collect();
+				batch_add_edges(&mut self.graph, false, &mut add_edges);
+			}
+			self.update_neighbors(mat);
+			// #[cfg(debug_assertions)]
+			println!("Loop: {:?}, Nodes: {:?}, Edges: {:?}", _i, self.graph.n_vertices(), self.graph.n_edges());
+		});
+		/* Sanity check to ensure the graph is simple directed */
+		// self.remove_duplicate_edges();
 	}
 }
 
@@ -803,24 +865,6 @@ pub struct SENDescentBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distanc
 	dist: Dist,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> SENDescentBuilder<R, F, Dist> {
-	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
-		let (n_outer_loops, n_inner_loops) = (self.params.n_outer_loops, self.params.n_outer_loops);
-		(0..n_outer_loops).for_each(|i| {
-			(0..n_inner_loops).for_each(|_j| {
-				self.update_neighbors(mat);
-				#[cfg(debug_assertions)]
-				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, _j, self.graph.n_vertices(), self.graph.n_edges());
-			});
-			if i != n_outer_loops-1 {
-				self.add_reverse_edges();
-				#[cfg(debug_assertions)]
-				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, n_inner_loops, self.graph.n_vertices(), self.graph.n_edges());
-			}
-		});
-		/* Sanity check to ensure the graph is simple directed */
-		// self.remove_duplicate_edges();
-		if self.params.prune_non_sen_edges { self.prune_non_sen_edges(mat); }
-	}
 	fn update_neighbors<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		let thread_chunk_size = self.params.concurrent_batch_size;
 		let global_chunk_size = thread_chunk_size*current_num_threads();
@@ -1035,12 +1079,12 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNStyle
 	#[inline(always)]
 	fn _into_graph_dist(self) -> (RNNBuildGraph<R,F>, Dist) { (self.graph, self.dist) }
 	#[inline(always)]
-	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
+	fn new<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
 		assert!(n_data < R::max_value().to_usize().unwrap());
 		let graph = RNNBuildGraph::new();
 		let reduce_degree = params.reduce_degree;
-		let mut builder = Self {
+		Self {
 			_phantom: std::marker::PhantomData,
 			n_data,
 			params,
@@ -1049,10 +1093,25 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNStyle
 			add_edge_cache: Vec::new(),
 			graph,
 			dist,
-		};
-		builder.init_random(mat);
-		builder.train(mat);
-		builder
+		}
+	}
+	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
+		let (n_outer_loops, n_inner_loops) = (self.params.n_outer_loops, self.params.n_outer_loops);
+		(0..n_outer_loops).for_each(|i| {
+			(0..n_inner_loops).for_each(|_j| {
+				self.update_neighbors(mat);
+				#[cfg(debug_assertions)]
+				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, _j, self.graph.n_vertices(), self.graph.n_edges());
+			});
+			if i != n_outer_loops-1 {
+				self.add_reverse_edges();
+				#[cfg(debug_assertions)]
+				println!("Outer loop: {:?}, Inner loop: {:?}, Nodes: {:?}, Edges: {:?}", i, n_inner_loops, self.graph.n_vertices(), self.graph.n_edges());
+			}
+		});
+		/* Sanity check to ensure the graph is simple directed */
+		// self.remove_duplicate_edges();
+		if self.params.prune_non_sen_edges { self.prune_non_sen_edges(mat); }
 	}
 }
 
@@ -1085,31 +1144,6 @@ pub struct SENEgoDescentBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Dist
 	dist: Dist,
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> SENEgoDescentBuilder<R, F, Dist> {
-	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
-		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum::<usize>());
-		println!("After initialization, Nodes: {:?}, Edges: {:?}", self.graph.n_vertices(), self.graph.n_edges());
-		let true_radius = self.params.radius;
-		(0..self.params.n_loops).for_each(|_i| {
-			if _i > 0 {
-				let mut add_edges = (0..self.graph.n_vertices()).map(|u| {
-					let u = R::from_usize(u).unwrap();
-					self.graph.get_adj(u).iter()
-					.map(move |&(dist,v,_)| (v,u,dist))
-				}).flatten().collect();
-				batch_add_edges(&mut self.graph, false, &mut add_edges);
-			}
-			self.params.radius = 1;
-			self.update_neighbors(mat);
-			let n_rand_edges = self.graph.n_edges()/2;
-			add_random_edges(mat, &mut self.graph, &self.dist, n_rand_edges);
-			self.params.radius = true_radius;
-			self.update_neighbors(mat);
-			// #[cfg(debug_assertions)]
-			println!("Loop: {:?}, Nodes: {:?}, Edges: {:?}", _i, self.graph.n_vertices(), self.graph.n_edges());
-		});
-		/* Sanity check to ensure the graph is simple directed */
-		// self.remove_duplicate_edges();
-	}
 	fn update_neighbors<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
 		let n_threads = current_num_threads();
 		let thread_chunk_size = self.params.concurrent_batch_size;
@@ -1209,21 +1243,43 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNStyle
 	fn _initial_degree(&self) -> usize { self.params.initial_degree }
 	#[inline(always)]
 	fn _into_graph_dist(self) -> (RNNBuildGraph<R,F>, Dist) { (self.graph, self.dist) }
-	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
+	fn new<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
 		let n_data = mat.n_rows();
 		assert!(n_data < R::max_value().to_usize().unwrap());
 		let graph = RNNBuildGraph::new();
-		let mut builder = Self {
+		Self {
 			_phantom: std::marker::PhantomData,
 			n_data,
 			params,
 			node_locks: (0..n_data).map(|_| Mutex::new(())).collect(),
 			graph,
 			dist,
-		};
-		builder.init_random(mat);
-		builder.train(mat);
-		builder
+		}
+	}
+	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
+		assert_eq!(self.graph.n_edges(), (0..self.graph.n_vertices()).map(|u| self.graph.get_adj(R::from_usize(u).unwrap()).len()).sum::<usize>());
+		println!("After initialization, Nodes: {:?}, Edges: {:?}", self.graph.n_vertices(), self.graph.n_edges());
+		let true_radius = self.params.radius;
+		(0..self.params.n_loops).for_each(|_i| {
+			if _i > 0 {
+				let mut add_edges = (0..self.graph.n_vertices()).map(|u| {
+					let u = R::from_usize(u).unwrap();
+					self.graph.get_adj(u).iter()
+					.map(move |&(dist,v,_)| (v,u,dist))
+				}).flatten().collect();
+				batch_add_edges(&mut self.graph, false, &mut add_edges);
+			}
+			self.params.radius = 1;
+			self.update_neighbors(mat);
+			let n_rand_edges = self.graph.n_edges()/2;
+			add_random_edges(mat, &mut self.graph, &self.dist, n_rand_edges);
+			self.params.radius = true_radius;
+			self.update_neighbors(mat);
+			// #[cfg(debug_assertions)]
+			println!("Loop: {:?}, Nodes: {:?}, Edges: {:?}", _i, self.graph.n_vertices(), self.graph.n_edges());
+		});
+		/* Sanity check to ensure the graph is simple directed */
+		// self.remove_duplicate_edges();
 	}
 }
 

@@ -68,7 +68,7 @@ pub fn graph_based_dendrogram<
 	R: SyncUnsignedInteger,
 	M: MatrixDataSource<F>+graphidx::types::Sync,
 	Dist: Distance<F>+Sync+Send,
->(data: &M, dist: Dist, min_pts: usize, symmetric_expand: bool, hnsw_params: HNSWParams) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
+>(data: &M, dist: Dist, min_pts: usize, symmetric_expand: bool, hnsw_params: HNSWParams<F>) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
 	let n = data.n_rows();
 	assert!(R::max_value().to_usize().unwrap() >= n);
 	/* Build HNSW on the data and get the graphs */

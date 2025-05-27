@@ -21,6 +21,7 @@ use rayon::slice::ParallelSliceMut;
 use ndarray::Array2;
 
 use crate::util::remove_duplicates_with_key;
+use crate::rnn::{RNNStyleBuilder, RNNParams, RNNDescentBuilder, SENParams, SENDescentBuilder};
 
 // type HashSet<T> = foldhash::HashSet<T>;
 // type HashSet<T> = graphidx::sets::ArraySet<T,u8>;
@@ -53,6 +54,10 @@ impl<R: UnsignedInteger, F: Float> HNSWHeapBuildGraph<R,F> {
 	}
 }
 impl<R: UnsignedInteger, F: Float> Graph<R> for HNSWHeapBuildGraph<R,F> {
+	#[inline(always)]
+	fn clear_neighbors(&mut self, vertex: R) {
+		self.view_neighbors_heap_mut(vertex).clear();
+	}
 	#[inline(always)]
 	fn reserve(&mut self, n_vertices: usize) {
 		self.adjacency.reserve(n_vertices);
@@ -280,7 +285,7 @@ pub trait HNSWStyleBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<
 	#[inline(always)]
 	fn _get_dist<M: MatrixDataSource<F>>(&self, mat: &M, i: usize, j: usize) -> F {
 		if M::SUPPORTS_ROW_VIEW {
-			self._dist().dist_slice(&mat.get_row_view(i), &mat.get_row_view(j))
+			self._dist().dist_slice(mat.get_row_view(i), mat.get_row_view(j))
 		} else {
 			self._dist().dist(&mat.get_row(i), &mat.get_row(j))
 		}
@@ -446,11 +451,117 @@ pub trait HNSWStyleBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<
 			entry_points.push((min_dist, min_idx));
 		}
 	}
+	fn finetune_rnn<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, rnn_params: RNNParams) {
+		let (lowest_max_degree, higher_max_degree) = self._max_degrees();
+		let dist = self._dist().clone();
+		let layer_0_params = rnn_params.clone()
+		.with_initial_degree(lowest_max_degree)
+		.with_reduce_degree(lowest_max_degree);
+		let graph = &mut self._mut_graphs()[0];
+		let mut rnn = RNNDescentBuilder::from_weighted_graph(
+			mat, graph, dist.clone(), layer_0_params,
+		);
+		rnn.train(mat);
+		let (rnn_graph, _) = rnn._into_graph_dist();
+		let n_vertices = rnn_graph.n_vertices();
+		assert_eq!(n_vertices, graph.n_vertices(), "Graph size mismatch during RNN refinement");
+		unsafe {
+			(0..n_vertices).for_each(|u| {
+				let u = R::from_usize(u).unwrap_unchecked();
+				graph.clear_neighbors(u);
+				rnn_graph.foreach_neighbor_with_zipped_weight(u, |&w,&v| {
+					if u != v {
+						graph.add_edge_with_weight(u,v,w);
+					}
+				});
+			});
+		}
+		let layer_i_params = rnn_params.clone()
+		.with_initial_degree(higher_max_degree)
+		.with_reduce_degree(higher_max_degree);
+		let unsafe_self = self as *mut Self;
+		unsafe {
+			(*unsafe_self)._mut_graphs().iter_mut().skip(1)
+			.zip((*unsafe_self)._global_layer_ids().iter())
+			.for_each(|(graph, global_ids)| {
+				let copied_mat = mat.get_rows(&global_ids.iter().map(|&i| i.to_usize().unwrap_unchecked()).collect::<Vec<usize>>());
+				let mut rnn = RNNDescentBuilder::from_weighted_graph(
+					&copied_mat, graph, dist.clone(), layer_i_params,
+				);
+				rnn.train(&copied_mat);
+				let (rnn_graph, _) = rnn._into_graph_dist();
+				let n_vertices = rnn_graph.n_vertices();
+				assert_eq!(n_vertices, graph.n_vertices(), "Graph size mismatch during RNN refinement");
+				(0..n_vertices).for_each(|u| {
+					let u = R::from_usize(u).unwrap_unchecked();
+					graph.clear_neighbors(u);
+					rnn_graph.foreach_neighbor_with_zipped_weight(u, |&w,&v| {
+						if u != v {
+							graph.add_edge_with_weight(u,v,w);
+						}
+					});
+				});
+			});
+		}
+	}
+	fn finetune_sen<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M, sen_params: SENParams<F>) {
+		let (lowest_max_degree, higher_max_degree) = self._max_degrees();
+		let dist = self._dist().clone();
+		let layer_0_params = sen_params.clone()
+		.with_initial_degree(lowest_max_degree)
+		.with_reduce_degree(lowest_max_degree);
+		let graph = &mut self._mut_graphs()[0];
+		let mut sen = SENDescentBuilder::from_weighted_graph(
+			mat, graph, dist.clone(), layer_0_params,
+		);
+		sen.train(mat);
+		let (sen_graph, _) = sen._into_graph_dist();
+		let n_vertices = sen_graph.n_vertices();
+		assert_eq!(n_vertices, graph.n_vertices(), "Graph size mismatch during SEN refinement");
+		unsafe {
+			(0..n_vertices).for_each(|u| {
+				let u = R::from_usize(u).unwrap_unchecked();
+				graph.clear_neighbors(u);
+				sen_graph.foreach_neighbor_with_zipped_weight(u, |&w,&v| {
+					if u != v {
+						graph.add_edge_with_weight(u,v,w);
+					}
+				});
+			});
+		}
+		let layer_i_params = sen_params.clone()
+		.with_initial_degree(higher_max_degree)
+		.with_reduce_degree(higher_max_degree);
+		let unsafe_self = self as *mut Self;
+		unsafe {
+			(*unsafe_self)._mut_graphs().iter_mut().skip(1)
+			.zip((*unsafe_self)._global_layer_ids().iter())
+			.for_each(|(graph, global_ids)| {
+				let copied_mat = mat.get_rows(&global_ids.iter().map(|&i| i.to_usize().unwrap_unchecked()).collect::<Vec<usize>>());
+				let mut sen = SENDescentBuilder::from_weighted_graph(
+					&copied_mat, graph, dist.clone(), layer_i_params,
+				);
+				sen.train(&copied_mat);
+				let (sen_graph, _) = sen._into_graph_dist();
+				let n_vertices = sen_graph.n_vertices();
+				assert_eq!(n_vertices, graph.n_vertices(), "Graph size mismatch during RNN refinement");
+				(0..n_vertices).for_each(|u| {
+					let u = R::from_usize(u).unwrap_unchecked();
+					graph.clear_neighbors(u);
+					sen_graph.foreach_neighbor_with_zipped_weight(u, |&w,&v| {
+						if u != v {
+							graph.add_edge_with_weight(u,v,w);
+						}
+					});
+				});
+			});
+		}
+	}
 }
 
 
 
-param_struct!(HNSWParams[Copy, Clone] {
+param_struct!(HNSWParams[Copy, Clone]<F: SyncFloat> {
 	higher_max_degree: usize = 50,
 	lowest_max_degree: usize = 100,
 	max_layers: usize = 10,
@@ -463,6 +574,10 @@ param_struct!(HNSWParams[Copy, Clone] {
 	post_prune_heuristic: bool = false,
 	insert_minibatch_size: usize = 100,
 	n_rounds: usize = 1,
+	finetune_rnn: bool = false,
+	finetune_sen: bool = false,
+	finetune_rnn_params: RNNParams = RNNParams::new(),
+	finetune_sen_params: SENParams<F> = SENParams::new(),
 });
 
 
@@ -477,7 +592,7 @@ pub mod single_threaded {
 	pub struct HNSWBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
 		_phantom: std::marker::PhantomData<F>,
 		n_data: usize,
-		params: HNSWParams,
+		params: HNSWParams<F>,
 		// add_edge_cache: Vec<(R,R,F)>,
 		// rem_edge_cache: Vec<(R,R)>,
 		n_layers: usize,
@@ -628,7 +743,7 @@ pub mod single_threaded {
 		}
 	}
 	impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWBuilder<R, F, Dist> {
-		type Params = HNSWParams;
+		type Params = HNSWParams<F>;
 		type Graph = HNSWBuildGraph<R,F>;
 		#[inline(always)]
 		fn _mut_graphs(&mut self) -> &mut Vec<HNSWBuildGraph<R,F>> { &mut self.graphs }
@@ -679,7 +794,7 @@ pub mod single_threaded {
 	pub struct HNSWHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
 		_phantom: std::marker::PhantomData<F>,
 		n_data: usize,
-		params: HNSWParams,
+		params: HNSWParams<F>,
 		// add_edge_cache: Vec<(R,R,F)>,
 		// rem_edge_cache: Vec<(R,R)>,
 		n_layers: usize,
@@ -820,7 +935,7 @@ pub mod single_threaded {
 		}
 	}
 	impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWHeapBuilder<R, F, Dist> {
-		type Params = HNSWParams;
+		type Params = HNSWParams<F>;
 		type Graph = HNSWHeapBuildGraph<R,F>;
 		#[inline(always)]
 		fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -872,7 +987,7 @@ pub mod single_threaded {
 	pub struct HNSWHeapBuilder2<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
 		_phantom: std::marker::PhantomData<F>,
 		n_data: usize,
-		params: HNSWParams,
+		params: HNSWParams<F>,
 		// add_edge_cache: Vec<(R,R,F)>,
 		// rem_edge_cache: Vec<(R,R)>,
 		n_layers: usize,
@@ -1044,7 +1159,7 @@ pub mod single_threaded {
 		}
 	}
 	impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWHeapBuilder2<R, F, Dist> {
-		type Params = HNSWParams;
+		type Params = HNSWParams<F>;
 		type Graph = HNSWHeapBuildGraph<R,F>;
 		#[inline(always)]
 		fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -1145,7 +1260,7 @@ pub struct HNSWParallelHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: D
 	_phantom: std::marker::PhantomData<F>,
 	n_data: usize,
 	n_threads: usize,
-	params: HNSWParams,
+	params: HNSWParams<F>,
 	node_locks: Vec<Mutex<()>>,
 	n_layers: usize,
 	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
@@ -1291,7 +1406,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		});
 		(1..self.params.n_rounds).for_each(|i_round| {
 			let perm_gen = RandomPermutationGenerator::new(self.n_data-1, 4);
-			let chunk_size = (self.n_data-n_burnin + self.n_threads - 1) / self.n_threads;
+			let chunk_size = (self.n_data + self.n_threads - 1) / self.n_threads;
 			(0..self.n_data-1).step_by(chunk_size)
 			.map(|start| start..(start+chunk_size).min(self.n_data-1))
 			.zip(thread_caches.iter_mut())
@@ -1305,12 +1420,18 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				}
 			});
 		});
+		if self.params.finetune_rnn {
+			self.finetune_rnn(mat, self.params.finetune_rnn_params.clone());
+		}
+		if self.params.finetune_sen {
+			self.finetune_sen(mat, self.params.finetune_sen_params.clone());
+		}
 		if self.params.post_prune_heuristic {
 			self.heuristic_post_prune(mat);
 		}
 	}
-	fn insert<M: MatrixDataSource<F>+Sync>(&mut self, i_round: usize, mat: &M, mut i: usize, i_global: usize, level: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
-		/* We just assume that the global index 1 is the root entry point */
+	fn insert<M: MatrixDataSource<F>+Sync>(&mut self, _i_round: usize, mat: &M, mut i: usize, i_global: usize, level: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
+		/* We just assume that the global index 0 is the root entry point */
 		let top_entry_dist = self._get_dist(mat, i_global, 0);
 		thread_cache.entry_points.clear();
 		thread_cache.entry_points.push((top_entry_dist, R::zero()));
@@ -1321,7 +1442,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			thread_cache.entry_points.iter_mut().for_each(|(_,j)| *j = unsafe{local_ids[j.to_usize().unwrap_unchecked()]});
 		});
 		(0..level+1).rev().for_each(|i_layer| {
-			if i_round > 0 { self.graphs[i_layer].view_neighbors_heap_mut(unsafe{R::from(i).unwrap_unchecked()}).clear(); }
+			// if _i_round > 0 { self.graphs[i_layer].view_neighbors_heap_mut(unsafe{R::from(i).unwrap_unchecked()}).clear(); }
 			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
 			self.insert_layer(mat, i, i_global, i_layer, thread_cache);
 			if i_layer > 0 {
@@ -1354,7 +1475,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 					neighbors.iter()
 					/* This should almost never matter, but this node can be found by another
 					 * searching thread while creating the adjacency list. */
-					.filter(|&&(_,j)| !heuristic_hashset.contains(&j))
+					.filter(|&&(_,j)| heuristic_hashset.insert(j))
 					.take(max_neighbors)
 					.for_each(|&(d,j)| {
 						if i_adj.size() < max_neighbors {
@@ -1367,6 +1488,9 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			} else {
 				/* Maybe extend candidate set with neighbors of neighbors */
 				let mut candidates = neighbors.clone();
+				/* Add previous neighbors to the candidate set */
+				candidates.extend(i_adj.iter());
+				i_adj.clear();
 				if self.params.insert_heuristic_extend {
 					heuristic_hashset.clear();
 					candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
@@ -1391,15 +1515,14 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				let mut tmp_list = Vec::with_capacity(candidates.len());
 				let mut cand_iter = candidates.into_iter().peekable();
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
 					while cand_iter.peek().is_some() && heuristic_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
 					if cand_iter.peek().is_some() {
-						let (dij,j) = cand_iter.next().unwrap_unchecked();
-						i_adj.push(dij,j);
-						heuristic_hashset.insert(j);
+						let (dij0,j0) = cand_iter.next().unwrap_unchecked();
+						i_adj.push(dij0,j0);
+						heuristic_hashset.insert(j0);
 						for (dij,j) in cand_iter {
 							if i_adj.size() >= max_neighbors { break; }
-							if heuristic_hashset.contains(&j) { continue; }
+							if !heuristic_hashset.insert(j) { continue; }
 							if i_adj.iter().all(|&(dik,k)| {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								let k_global = if layer>0 { self.global_layer_ids[layer-1][k.to_usize().unwrap_unchecked()] } else { k };
@@ -1493,7 +1616,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWParallelHeapBuilder<R, F, Dist> {
-	type Params = HNSWParams;
+	type Params = HNSWParams<F>;
 	type Graph = HNSWHeapBuildGraph<R,F>;
 	#[inline(always)]
 	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -1545,7 +1668,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 
 pub struct FloodingHNSWBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
 	_phantom: std::marker::PhantomData<F>,
-	params: HNSWParams,
+	params: HNSWParams<F>,
 	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
 	local_layer_ids: Vec<Vec<R>>,
 	global_layer_ids: Vec<Vec<R>>,
@@ -1619,7 +1742,122 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> Flooding
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for FloodingHNSWBuilder<R, F, Dist> {
-	type Params = HNSWParams;
+	type Params = HNSWParams<F>;
+	type Graph = HNSWHeapBuildGraph<R,F>;
+	#[inline(always)]
+	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
+	#[inline(always)]
+	fn _graphs(&self) -> &Vec<HNSWHeapBuildGraph<R,F>> { &self.graphs }
+	#[inline(always)]
+	fn _global_layer_ids(&self) -> &Vec<Vec<R>> { &self.global_layer_ids }
+	#[inline(always)]
+	fn _dist(&self) -> &Dist { &self.dist }
+	#[inline(always)]
+	fn _max_build_heap_size(&self) -> usize { self.params.max_build_heap_size }
+	#[inline(always)]
+	fn _max_build_frontier_size(&self) -> Option<usize> { self.params.max_build_frontier_size }
+	#[inline(always)]
+	fn _into_parts(self) -> (Vec<HNSWHeapBuildGraph<R,F>>, Vec<Vec<R>>, Vec<Vec<R>>, Dist) {
+		(self.graphs, self.local_layer_ids, self.global_layer_ids, self.dist)
+	}
+	#[inline(always)]
+	fn _max_degrees(&self) -> (usize, usize) {
+		(self.params.lowest_max_degree, self.params.higher_max_degree)
+	}
+	fn base_init<M: MatrixDataSource<F>+Sync>(mat: &M, dist: Dist, params: Self::Params) -> Self {
+		let n_data = mat.n_rows();
+		assert!(n_data < R::max_value().to_usize().unwrap());
+		let mut builder = Self {
+			_phantom: std::marker::PhantomData,
+			params,
+			graphs: vec![],
+			local_layer_ids: vec![],
+			global_layer_ids: vec![],
+			dist,
+		};
+		builder.train(mat);
+		builder
+	}
+
+}
+
+pub struct FloodingHNSWSENBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
+	_phantom: std::marker::PhantomData<F>,
+	params: HNSWSENParams<F>,
+	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
+	local_layer_ids: Vec<Vec<R>>,
+	global_layer_ids: Vec<Vec<R>>,
+	dist: Dist,
+}
+impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> FloodingHNSWSENBuilder<R, F, Dist> {
+	fn flood_select<G: Graph<R>+Sync>(graph: &G, max_degree: usize) -> Vec<R> {
+		let n_vertices = graph.n_vertices();
+		let mut in_edges: Vec<Vec<R>> = vec![Vec::with_capacity(max_degree); n_vertices];
+		unsafe {
+			(0..n_vertices).for_each(|i| {
+				let i = R::from_usize(i).unwrap_unchecked();
+				graph.iter_neighbors(i).for_each(|j| {
+					in_edges[j.to_usize().unwrap_unchecked()].push(i);
+				});
+			});
+		}
+		let n_buckets = (n_vertices+63)/64;
+		let selected = vec![0u64; n_buckets];
+		let perm = RandomPermutationGenerator::new(n_vertices, 4);
+		unsafe {
+			let n_threads = rayon::current_num_threads();
+			let chunk_size = (n_vertices + n_threads - 1) / n_threads;
+			(0..n_threads).into_par_iter().map(|i_chunk| {
+				let start = chunk_size * i_chunk;
+				let end = (start+chunk_size).min(n_vertices);
+				let mut selected_idxs = Vec::with_capacity(chunk_size);
+				let unsafe_selected = std::ptr::addr_of!(selected) as *const Vec<u64> as *mut Vec<u64>;
+				(start..end).for_each(|i| {
+					let i = perm.apply_rounds(i);
+					let covered = in_edges.get_unchecked(i).iter().any(|j| {
+						selected.get_bit_unchecked(j.to_usize().unwrap_unchecked()/64)
+					});
+					if !covered {
+						unsafe_selected.as_mut().unwrap_unchecked().set_bit_unchecked(i/64, true);
+						selected_idxs.push(R::from(i).unwrap_unchecked());
+					}
+				});
+				selected_idxs
+			}).collect::<Vec<Vec<R>>>().into_iter()
+			.map(|v| v.into_iter())
+			.flatten().collect()
+		}
+	}
+	fn train<M: MatrixDataSource<F>+Sync>(&mut self, mat: &M) {
+		let param_max_layers = self.params.max_layers;
+		self.params.max_layers = 1;
+		let lowest_level_builder: HNSWParallelSENHeapBuilder<R, F, Dist> = HNSWParallelSENHeapBuilder::base_init(mat, self.dist.clone(), self.params.clone());
+		let (mut graphs,_,_,_) = lowest_level_builder._into_parts();
+		self.graphs.push(graphs.pop().unwrap());
+		unsafe {
+			for i_layer in 1..param_max_layers {
+				if self.graphs.last().unwrap().n_vertices() < self.params.higher_max_degree { break; }
+				let local_ids: Vec<R> = Self::flood_select(&self.graphs[i_layer-1], self.params.lowest_max_degree);
+				let global_ids: Vec<R> = if i_layer==1 {
+					local_ids.iter().cloned().collect()
+				} else {
+					local_ids.iter().map(|&i| {
+						self.global_layer_ids[i_layer-2][i.to_usize().unwrap_unchecked()]
+					}).collect()
+				};
+				self.local_layer_ids.push(local_ids);
+				self.global_layer_ids.push(global_ids);
+				let local_data = mat.get_rows(&self.global_layer_ids[i_layer-1].iter().map(|v| v.to_usize().unwrap_unchecked()).collect::<Vec<_>>());
+				self.params.lowest_max_degree = self.params.higher_max_degree;
+				let curr_level_builder = HNSWParallelSENHeapBuilder::base_init(&local_data, self.dist.clone(), self.params.clone());
+				let (mut curr_graphs, _, _, _) = curr_level_builder._into_parts();
+				self.graphs.push(curr_graphs.pop().unwrap());
+			}
+		}
+	}
+}
+impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for FloodingHNSWSENBuilder<R, F, Dist> {
+	type Params = HNSWSENParams<F>;
 	type Graph = HNSWHeapBuildGraph<R,F>;
 	#[inline(always)]
 	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -1662,7 +1900,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyl
 
 
 
-param_struct!(HNSWSENParams[Copy, Clone] {
+param_struct!(HNSWSENParams[Copy, Clone]<F: SyncFloat> {
 	higher_max_degree: usize = 50,
 	lowest_max_degree: usize = 100,
 	max_layers: usize = 10,
@@ -1675,13 +1913,17 @@ param_struct!(HNSWSENParams[Copy, Clone] {
 	post_prune_heuristic: bool = false,
 	insert_minibatch_size: usize = 100,
 	n_rounds: usize = 1,
+	finetune_rnn: bool = false,
+	finetune_sen: bool = false,
+	finetune_rnn_params: RNNParams = RNNParams::new(),
+	finetune_sen_params: SENParams<F> = SENParams::new(),
 	max_cos: f64 = 0.5,
 });
 pub struct HNSWParallelSENHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> {
 	_phantom: std::marker::PhantomData<F>,
 	n_data: usize,
 	n_threads: usize,
-	params: HNSWSENParams,
+	params: HNSWSENParams<F>,
 	node_locks: Vec<Mutex<()>>,
 	n_layers: usize,
 	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
@@ -1796,7 +2038,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		/* Preallocate graphs and ID lookups and assign levels and level positions for each input */
 		let (layer_sizes, point_levels, point_level_pos) = self.initialize_structure();
 		/* Burnin single thread for a few samples */
-		let n_burnin = self.params.n_parallel_burnin;
+		let n_burnin: usize = self.params.n_parallel_burnin.min(self.n_data-1);
 		let mut burnin_cache = HNSWThreadCache::new(&layer_sizes, self.params.max_build_heap_size, self.params.lowest_max_degree, self.params.max_build_frontier_size);
 		(1..n_burnin+1).for_each(|i| {
 			self.insert(0, mat, point_level_pos[i], i, point_levels[i], &mut burnin_cache);
@@ -1831,11 +2073,17 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				}
 			});
 		});
+		if self.params.finetune_rnn {
+			self.finetune_rnn(mat, self.params.finetune_rnn_params.clone());
+		}
+		if self.params.finetune_sen {
+			self.finetune_sen(mat, self.params.finetune_sen_params.clone());
+		}
 		if self.params.post_prune_heuristic {
 			self.prune_non_sen_edges(mat);
 		}
 	}
-	fn insert<M: MatrixDataSource<F>+Sync>(&mut self, i_round: usize, mat: &M, mut i: usize, i_global: usize, level: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
+	fn insert<M: MatrixDataSource<F>+Sync>(&mut self, _i_round: usize, mat: &M, mut i: usize, i_global: usize, level: usize, thread_cache: &mut HNSWThreadCache<R,F>) {
 		/* We just assume that the global index 1 is the root entry point */
 		let top_entry_dist = self._get_dist(mat, i_global, 0);
 		thread_cache.entry_points.clear();
@@ -1847,7 +2095,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			thread_cache.entry_points.iter_mut().for_each(|(_,j)| *j = unsafe{local_ids[j.to_usize().unwrap_unchecked()]});
 		});
 		(0..level+1).rev().for_each(|i_layer| {
-			if i_round > 0 {self.graphs[i_layer].view_neighbors_heap_mut(unsafe{R::from_usize(i).unwrap_unchecked()}).clear();}
+			// if i_round > 0 {self.graphs[i_layer].view_neighbors_heap_mut(unsafe{R::from_usize(i).unwrap_unchecked()}).clear();}
 			self._search_layer(mat, i_global, i_layer, unsafe{thread_cache.search_hashsets.get_unchecked_mut(i_layer)}, &mut thread_cache.search_maxheap, &mut thread_cache.frontier_minheap, &mut thread_cache.frontier_dualheap, &mut thread_cache.entry_points, Some(self.params.max_build_heap_size));
 			self.insert_layer(mat, i, i_global, i_layer, thread_cache);
 			if i_layer > 0 {
@@ -1873,6 +2121,8 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 		let heuristic_hashset = unsafe{thread_cache.heuristic_hashsets.get_unchecked_mut(layer)};
 		/* Translate i into a local (current graph) and a global (dataset/distance computations) ID */
 		let i = unsafe{R::from_usize(i).unwrap_unchecked()};
+		/* Choose the appropriate max degree */
+		let max_neighbors = if layer == 0 { self.params.lowest_max_degree } else { self.params.higher_max_degree };
 		/* Unsafe graph reference to have `self` accessible downstream */
 		let graph = &mut self.graphs[layer] as *mut HNSWHeapBuildGraph<R,F>;
 		unsafe {
@@ -1888,7 +2138,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 					neighbors.iter()
 					/* This should almost never matter, but this node can be found by another
 					 * searching thread while creating the adjacency list. */
-					.filter(|&&(_,j)| !heuristic_hashset.contains(&j))
+					.filter(|&&(_,j)| heuristic_hashset.insert(j))
 					.take(max_neighbors)
 					.for_each(|&(d,j)| {
 						if i_adj.size() < max_neighbors {
@@ -1901,6 +2151,9 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			} else {
 				/* Maybe extend candidate set with neighbors of neighbors */
 				let mut candidates = neighbors.clone();
+				/* Add previous neighbors to the candidate set */
+				candidates.extend(i_adj.iter());
+				i_adj.clear();
 				if self.params.insert_heuristic_extend {
 					heuristic_hashset.clear();
 					candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
@@ -1925,15 +2178,14 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				let mut tmp_list = Vec::with_capacity(candidates.len());
 				let mut cand_iter = candidates.into_iter().peekable();
 				with_guard!(self, i_global, {
-					i_adj.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
 					while cand_iter.peek().is_some() && heuristic_hashset.contains(&cand_iter.peek().unwrap_unchecked().1) { cand_iter.next(); }
 					if cand_iter.peek().is_some() {
-						let (dij,j) = cand_iter.next().unwrap_unchecked();
-						i_adj.push(dij,j);
-						heuristic_hashset.insert(j);
+						let (dij0,j0) = cand_iter.next().unwrap_unchecked();
+						i_adj.push(dij0,j0);
+						heuristic_hashset.insert(j0);
 						for (dij,j) in cand_iter {
 							if i_adj.size() >= max_neighbors { break; }
-							if heuristic_hashset.contains(&j) { continue; }
+							if !heuristic_hashset.insert(j) { continue; }
 							if i_adj.iter().all(|&(dik,k)| {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								let k_global = if layer>0 { self.global_layer_ids[layer-1][k.to_usize().unwrap_unchecked()] } else { k };
@@ -1947,9 +2199,9 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 								tmp_list.push((dij,j));
 							}
 						};
-						if min_neighbors > i_adj.size() {
+						if max_neighbors > i_adj.size() {
 							/* Add removed edges back in */
-							tmp_list.iter().take(min_neighbors-i_adj.size().min(min_neighbors)).for_each(|&x| i_adj.push(x.0,x.1));
+							tmp_list.iter().take(max_neighbors-i_adj.size()).for_each(|&x| i_adj.push(x.0,x.1));
 						}
 					}
 				});
@@ -2068,7 +2320,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWParallelSENHeapBuilder<R, F, Dist> {
-	type Params = HNSWSENParams;
+	type Params = HNSWSENParams<F>;
 	type Graph = HNSWHeapBuildGraph<R,F>;
 	#[inline(always)]
 	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -2122,7 +2374,7 @@ pub struct HNSWParallelPresortedHeapBuilder<R: SyncUnsignedInteger, F: SyncFloat
 	_phantom: std::marker::PhantomData<F>,
 	n_data: usize,
 	n_threads: usize,
-	params: HNSWParams,
+	params: HNSWParams<F>,
 	node_locks: Vec<Mutex<()>>,
 	n_layers: usize,
 	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
@@ -2400,7 +2652,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWParallelPresortedHeapBuilder<R, F, Dist> {
-	type Params = HNSWParams;
+	type Params = HNSWParams<F>;
 	type Graph = HNSWHeapBuildGraph<R,F>;
 	#[inline(always)]
 	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -2453,7 +2705,7 @@ pub struct HNSWParallelHeapBuilder2<R: SyncUnsignedInteger, F: SyncFloat, Dist: 
 	_phantom: std::marker::PhantomData<F>,
 	n_data: usize,
 	n_threads: usize,
-	params: HNSWParams,
+	params: HNSWParams<F>,
 	n_layers: usize,
 	graphs: Vec<HNSWHeapBuildGraph<R,F>>,
 	local_layer_ids: Vec<Vec<R>>,
@@ -2745,7 +2997,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 	}
 }
 impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWStyleBuilder<R, F, Dist> for HNSWParallelHeapBuilder2<R, F, Dist> {
-	type Params = HNSWParams;
+	type Params = HNSWParams<F>;
 	type Graph = HNSWHeapBuildGraph<R,F>;
 	#[inline(always)]
 	fn _mut_graphs(&mut self) -> &mut Vec<HNSWHeapBuildGraph<R,F>> { &mut self.graphs }
@@ -2980,7 +3232,7 @@ pub fn load_hnswlib_capped<R: SyncUnsignedInteger, F: SyncFloat>(file: &str, max
 #[cfg(test)]
 mod tests {
 	use crate::hnsw::*;
-	use crate::hnsw::single_threaded::*;
+	// use crate::hnsw::single_threaded::*;
 	use ndarray::{Array2,Slice};
 	use ndarray_rand::rand_distr::Normal;
 	use rand::prelude::Distribution;
@@ -3009,14 +3261,17 @@ mod tests {
 	}
 
 	#[test]
-	fn hnsw_construction() {
+	fn rounds_hnsw_construction() {
 		let (n,d) = (10_000, 20);
 		let rng = Normal::new(0.0, 1.0).unwrap();
 		let data: Array2<f64> = Array2::from_shape_fn((n, d), |_| rng.sample(&mut rand::thread_rng()));
 		let params = HNSWParams::new()
-		.with_insert_heuristic_extend(false);
+		.with_insert_heuristic(false)
+		.with_insert_heuristic_extend(false)
+		.with_n_rounds(3);
 		let graph_time = std::time::Instant::now();
-		let _graph = HNSWBuilder::<u64,_,_>::build_fat(data, EuclideanDistance::new(), params, 1);
+		println!("Entering graph building.");
+		let _graph = HNSWParallelHeapBuilder::<u64,_,_>::build(data, SquaredEuclideanDistance::new(), params, 1);
 		println!("Graph construction: {:.2?}", graph_time.elapsed());
 	}
 	
