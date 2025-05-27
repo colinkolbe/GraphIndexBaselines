@@ -68,7 +68,7 @@ pub fn graph_based_dendrogram<
 	R: SyncUnsignedInteger,
 	M: MatrixDataSource<F>+graphidx::types::Sync,
 	Dist: Distance<F>+Sync+Send,
->(data: &M, dist: Dist, min_pts: usize, symmetric_expand: bool, hnsw_params: HNSWParams<F>) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
+>(data: &M, dist: Dist, min_pts: usize, expand: bool, symmetric_expand: bool, hnsw_params: HNSWParams<F>) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
 	let n = data.n_rows();
 	assert!(R::max_value().to_usize().unwrap() >= n);
 	/* Build HNSW on the data and get the graphs */
@@ -146,7 +146,7 @@ pub fn graph_based_dendrogram<
 			*cluster_ids.get_unchecked_mut(new_root) = new_id;
 			*cluster_sizes.get_unchecked_mut(new_root) = new_size;
 		};
-		while dendrogram.len() < n-1 {
+		while dendrogram.len() < n-1 && expand_queue.size() > 0 {
 			/* Get the next edge */
 			let (d_ij, (i, j)) = expand_queue.pop().unwrap_unchecked();
 			let i_usize = i.to_usize().unwrap_unchecked();
@@ -197,91 +197,95 @@ pub fn graph_based_dendrogram<
 					d_ij, i_root, j_root
 				);
 			}
-			/* Compute pairwise distances between neighborhoods in parallel.
-			* Skip loops and already merged pairs. */
-			let work_output = if symmetric_expand {
-				/* Extend the expand queue with neighbor-of-neighbor pairs */
-				let nodes1: Vec<R> = graph.iter_neighbors(i).cloned().chain(std::iter::once(i)).collect();
-				let nodes2: Vec<R> = graph.iter_neighbors(j).cloned().chain(std::iter::once(j)).collect();
-				let total_work = nodes1.len() * nodes2.len();
-				let n_threads = rayon::current_num_threads();
-				let work_per_thread = (total_work+n_threads-1) / n_threads;
-				let mut work_output: Vec<(F,(R,R))> = Vec::with_capacity(total_work);
-				work_output.set_len(total_work);
-				work_output.chunks_mut(work_per_thread).enumerate().collect::<Vec<_>>().into_par_iter().for_each(|(i_thread, output)| {
-					let start = i_thread * work_per_thread;
-					let end = std::cmp::min(start + work_per_thread, total_work);
-					(start..end).enumerate().for_each(|(i_output, i_job)| {
-						let output_cell = output.get_unchecked_mut(i_output);
-						let i = nodes1[i_job / nodes2.len()];
-						let j = nodes2[i_job % nodes2.len()];
-						if i == j {
-							*output_cell = (-F::one(), (R::zero(), R::zero()));
-							return;
-						}
-						let i_root = union_find.find_immutable(i);
-						let j_root = union_find.find_immutable(j);
-						if i_root == j_root {
-							*output_cell = (-F::one(), (R::zero(), R::zero()));
-							return;
-						}
-						let i_usize = i.to_usize().unwrap_unchecked();
-						let j_usize = j.to_usize().unwrap_unchecked();
-						let i_row = data.get_row_view(i_usize);
-						let j_row = data.get_row_view(j_usize);
-						let d_ij = dist.dist_slice(&i_row, &j_row);
-						*output_cell = (d_ij, (i.min(j), i.max(j)));
+			/* Expand on the edge and add new entries to the expand queue
+			 * unless that is disabled with `expand = false` */
+			if expand {
+				/* Compute pairwise distances between neighborhoods in parallel.
+				* Skip loops and already merged pairs. */
+				let work_output = if symmetric_expand {
+					/* Extend the expand queue with neighbor-of-neighbor pairs */
+					let nodes1: Vec<R> = graph.iter_neighbors(i).cloned().chain(std::iter::once(i)).collect();
+					let nodes2: Vec<R> = graph.iter_neighbors(j).cloned().chain(std::iter::once(j)).collect();
+					let total_work = nodes1.len() * nodes2.len();
+					let n_threads = rayon::current_num_threads();
+					let work_per_thread = (total_work+n_threads-1) / n_threads;
+					let mut work_output: Vec<(F,(R,R))> = Vec::with_capacity(total_work);
+					work_output.set_len(total_work);
+					work_output.chunks_mut(work_per_thread).enumerate().collect::<Vec<_>>().into_par_iter().for_each(|(i_thread, output)| {
+						let start = i_thread * work_per_thread;
+						let end = std::cmp::min(start + work_per_thread, total_work);
+						(start..end).enumerate().for_each(|(i_output, i_job)| {
+							let output_cell = output.get_unchecked_mut(i_output);
+							let i = nodes1[i_job / nodes2.len()];
+							let j = nodes2[i_job % nodes2.len()];
+							if i == j {
+								*output_cell = (-F::one(), (R::zero(), R::zero()));
+								return;
+							}
+							let i_root = union_find.find_immutable(i);
+							let j_root = union_find.find_immutable(j);
+							if i_root == j_root {
+								*output_cell = (-F::one(), (R::zero(), R::zero()));
+								return;
+							}
+							let i_usize = i.to_usize().unwrap_unchecked();
+							let j_usize = j.to_usize().unwrap_unchecked();
+							let i_row = data.get_row_view(i_usize);
+							let j_row = data.get_row_view(j_usize);
+							let d_ij = dist.dist_slice(&i_row, &j_row);
+							*output_cell = (d_ij, (i.min(j), i.max(j)));
+						});
 					});
-				});
-				work_output
-			} else {
-				/* Extend the expand queue with neighbor-of-neighbor pairs */
-				let nodes1: Vec<R> = graph.iter_neighbors(i).cloned().collect();
-				let nodes2: Vec<R> = graph.iter_neighbors(j).cloned().collect();
-				let total_work = nodes1.len() + nodes2.len();
-				let n_threads = rayon::current_num_threads();
-				let work_per_thread = (total_work+n_threads-1) / n_threads;
-				let mut work_output: Vec<(F,(R,R))> = Vec::with_capacity(total_work);
-				work_output.set_len(total_work);
-				work_output.chunks_mut(work_per_thread).enumerate().collect::<Vec<_>>().into_par_iter().for_each(|(i_thread, output)| {
-					let start = i_thread * work_per_thread;
-					let end = std::cmp::min(start + work_per_thread, total_work);
-					(start..end).enumerate().for_each(|(i_output, i_job)| {
-						let output_cell = output.get_unchecked_mut(i_output);
-						let (i,j) = if i_job < nodes1.len() {
-							(nodes1[i_job], j)
-						} else {
-							(i, nodes2[i_job - nodes1.len()])
-						};
-						if i == j {
-							*output_cell = (-F::one(), (R::zero(), R::zero()));
-							return;
-						}
-						let i_root = union_find.find_immutable(i);
-						let j_root = union_find.find_immutable(j);
-						if i_root == j_root {
-							*output_cell = (-F::one(), (R::zero(), R::zero()));
-							return;
-						}
-						let i_usize = i.to_usize().unwrap_unchecked();
-						let j_usize = j.to_usize().unwrap_unchecked();
-						let i_row = data.get_row_view(i_usize);
-						let j_row = data.get_row_view(j_usize);
-						let d_ij = dist.dist_slice(&i_row, &j_row);
-						*output_cell = (d_ij, (i.min(j), i.max(j)));
+					work_output
+				} else {
+					/* Extend the expand queue with neighbor-of-neighbor pairs */
+					let nodes1: Vec<R> = graph.iter_neighbors(i).cloned().collect();
+					let nodes2: Vec<R> = graph.iter_neighbors(j).cloned().collect();
+					let total_work = nodes1.len() + nodes2.len();
+					let n_threads = rayon::current_num_threads();
+					let work_per_thread = (total_work+n_threads-1) / n_threads;
+					let mut work_output: Vec<(F,(R,R))> = Vec::with_capacity(total_work);
+					work_output.set_len(total_work);
+					work_output.chunks_mut(work_per_thread).enumerate().collect::<Vec<_>>().into_par_iter().for_each(|(i_thread, output)| {
+						let start = i_thread * work_per_thread;
+						let end = std::cmp::min(start + work_per_thread, total_work);
+						(start..end).enumerate().for_each(|(i_output, i_job)| {
+							let output_cell = output.get_unchecked_mut(i_output);
+							let (i,j) = if i_job < nodes1.len() {
+								(nodes1[i_job], j)
+							} else {
+								(i, nodes2[i_job - nodes1.len()])
+							};
+							if i == j {
+								*output_cell = (-F::one(), (R::zero(), R::zero()));
+								return;
+							}
+							let i_root = union_find.find_immutable(i);
+							let j_root = union_find.find_immutable(j);
+							if i_root == j_root {
+								*output_cell = (-F::one(), (R::zero(), R::zero()));
+								return;
+							}
+							let i_usize = i.to_usize().unwrap_unchecked();
+							let j_usize = j.to_usize().unwrap_unchecked();
+							let i_row = data.get_row_view(i_usize);
+							let j_row = data.get_row_view(j_usize);
+							let d_ij = dist.dist_slice(&i_row, &j_row);
+							*output_cell = (d_ij, (i.min(j), i.max(j)));
+						});
 					});
+					work_output
+				};
+				/* Insert edges into the queue if not yet observed */
+				work_output.into_iter()
+				.filter(|(d,_)| *d >= F::zero())
+				.for_each(|(d_ij, (i, j))| {
+					if observed_edges.observe_edge(i, j) {
+						/* Only push if the edge was not already observed */
+						expand_queue.push(d_ij, (i.min(j), i.max(j)));
+					}
 				});
-				work_output
-			};
-			/* Insert edges into the queue if not yet observed */
-			work_output.into_iter()
-			.filter(|(d,_)| *d >= F::zero())
-			.for_each(|(d_ij, (i, j))| {
-				if observed_edges.observe_edge(i, j) {
-					/* Only push if the edge was not already observed */
-					expand_queue.push(d_ij, (i.min(j), i.max(j)));
-				}
-			});
+			}
 		}
 	}
 	// println!("{:?}", start_time.elapsed());

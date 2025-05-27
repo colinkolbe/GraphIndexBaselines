@@ -771,10 +771,11 @@ pub fn load_hnswlib_fat(file: &str, max_frontier_size: Option<usize>) -> OwningP
 }
 
 #[pyfunction]
-#[pyo3(signature = (data, min_pts, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None))]
+#[pyo3(signature = (data, min_pts, expand=None, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None))]
 pub fn graph_based_dendrogram<'py>(
 	data: Bound<'py, PyArray2<f32>>,
 	min_pts: usize,
+	expand: Option<bool>,
 	symmetric_expand: Option<bool>,
 	higher_max_degree: Option<usize>,
 	lowest_max_degree: Option<usize>,
@@ -808,7 +809,8 @@ pub fn graph_based_dendrogram<'py>(
 			&arrview2_py_to_rust(data.as_array()),
 			SquaredEuclideanDistance::new(),
 			min_pts,
-			symmetric_expand.unwrap_or(true),
+			expand.unwrap_or(true),
+			symmetric_expand.unwrap_or(false),
 			hnsw_params,
 		)
 	}
