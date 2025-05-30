@@ -38,7 +38,7 @@ numpy = { version = "0.23.0" }
 # criterion = { version = "0.5.1", features = ['html_reports'] }
 
 [features]
-default = ["python"]
+default = []
 python = ["pyo3", "numpy"]
 
 [profile.release]
@@ -54,6 +54,9 @@ features = ["python"]
 inherits = "release"
 debug = true
 strip = false
+
+[profile.test]
+inherits = "release-with-debug"
 
 [profile.bench]
 inherits = "release"
