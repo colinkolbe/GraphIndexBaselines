@@ -50,17 +50,17 @@ python = ["pyo3", "numpy"]
 # [profile.dev]
 # features = ["python"]
 
-[profile.test]
-inherits = "release"
-
 [profile.release-with-debug]
 inherits = "release"
 debug = true
 strip = false
 
-# [profile.bench]
-# inherits = "release"
-# features = []
+[profile.test]
+inherits = "release-with-debug"
+
+[profile.bench]
+inherits = "release"
+features = []
 
 # [[bench]]
 # name = "bench"
