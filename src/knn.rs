@@ -72,7 +72,7 @@ mod tests {
 		/* Limit global thread pool size */
 		// rayon::ThreadPoolBuilder::new().num_threads(16).build_global().unwrap();
 		/* Parameters */
-		let (nd, nq, d, k, search_heap_size) = (100_000, 1000, 50, 1, 10);
+		let (nd, nq, d, k, search_heap_size) = (1_000_000, 10_000, 50, 1, 1);
 		let euc = SquaredEuclideanDistance::new();
 		/* Data initialization */
 		let init_time = Instant::now();
@@ -91,7 +91,7 @@ mod tests {
 		/* Build and translate RNN Graph */
 		let build_time = Instant::now();
 		let dist = Dist::new();
-		let params = BruteforceKNNParams::new().with_degree(145);
+		let params = BruteforceKNNParams::new().with_degree(150);
 		type BuilderType = BruteforceKNNGraphBuilder<R,F,Dist>;
 		let index1 = BuilderType::build(data.view(), dist, params);
 		println!("Graph construction ({:?}): {:.2?}", std::any::type_name::<BuilderType>(), build_time.elapsed());
@@ -99,7 +99,7 @@ mod tests {
 			data.view(),
 			index1.graph().as_dir_lol_graph(),
 			SquaredEuclideanDistance::new(),
-			3*k,
+			10,
 			None,
 		);
 		/* Brute force queries */
@@ -143,7 +143,7 @@ mod tests {
 				let neighbors = base_graph.view_neighbors(u);
 				graph.add_edges_chunk(u, &neighbors[..degree].iter().cloned().collect());
 			});
-			let index = GreedySingleGraphIndex::new(data.view(), graph, SquaredEuclideanDistance::new(), None);
+			let index = GreedyCappedSingleGraphIndex::new(data.view(), graph, SquaredEuclideanDistance::new(), 10, None);
 			let ids = index.greedy_search_batch(&queries, k, search_heap_size).0;
 			let mut same = 0;
 			bruteforce_ids.axis_iter(Axis(0)).zip(ids.axis_iter(Axis(0))).for_each(|(bf, rnn)| {
@@ -152,7 +152,7 @@ mod tests {
 				same += bf_set.intersection(&hnsw_set).count();
 			});
 			let recall = same as f32 / (nq * k) as f32;
-			println!("{:03} {:6.2}%", max_degree, recall*100f32);
+			println!("{:03} {:6.2}%", degree, recall*100f32);
 		});
 	}
 }
