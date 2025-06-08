@@ -14,7 +14,6 @@ doc = true
 
 [dependencies]
 graphidx = { path = "../GraphIndexAPI", default-features = false }
-hsgf_lib = { path = "../hsgf/hsgf_lib", default-features = false }
 num = "0.4.0"
 ndarray = "0.15" # Has to be the same as used by hdf5 to work
 ndarray-rand = "0.14.0"
@@ -38,32 +37,29 @@ numpy = { version = "0.23.0" }
 # criterion = { version = "0.5.1", features = ['html_reports'] }
 
 [features]
-default = []
+default = ["python"]
 python = ["pyo3", "numpy"]
 
-# [profile.release]
+[profile.release]
 # features = ["python"]
-# opt-level = 3
-# lto = true
-# codegen-units = 1
+opt-level = 3
+lto = true
+codegen-units = 1
 
-# [profile.dev]
-# features = ["python"]
+[profile.dev]
+features = ["python"]
 
 [profile.release-with-debug]
 inherits = "release"
 debug = true
 strip = false
 
-[profile.test]
-inherits = "release-with-debug"
-
 [profile.bench]
 inherits = "release"
 features = []
 
-# [[bench]]
-# name = "bench"
+[[bench]]
+name = "bench"
 # harness = false
 
 
