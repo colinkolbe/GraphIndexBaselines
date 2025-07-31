@@ -314,6 +314,7 @@ mod tests {
 			graphidx::measures::SquaredEuclideanDistance::new(),
 			5,
 			true,
+			true,
 			HNSWParams::new(),
 		);
 		println!("Dendrogram computation took: {:.2?}", start_time.elapsed());
